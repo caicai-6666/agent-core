@@ -110,6 +110,15 @@ def normalize_model_json(value: Any, schema: dict, *, root: dict | None = None, 
         if isinstance(value, str) and any(kind(b) in ('object', 'array') for b in branches):
             decoded = load_model_json(value)
             return normalize_model_json(decoded, schema, root=root, depth=depth + 1)
+        discriminator = schema.get('discriminator', {})
+        if isinstance(value, dict) and 'mapping' in discriminator:
+            # Pydantic 明示分支时，仅以可信 Schema 中的映射选择；其他分支的同名字段可能是普通文本。
+            tag = value.get(discriminator['propertyName'])
+            if isinstance(tag, (str, int, bool)):
+                ref = discriminator['mapping'].get(str(tag))
+                if ref is not None:
+                    return normalize_model_json(value, {'$ref': ref}, root=root, depth=depth + 1)
+            return value
         expected = 'object' if isinstance(value, dict) else 'array' if isinstance(value, list) else None
         candidates = [b for b in branches if expected and kind(b) == expected]
         if len(candidates) == 1:

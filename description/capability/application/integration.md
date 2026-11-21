@@ -100,6 +100,8 @@ tool = RegisteredTool("project_schedule", "按项目全称查询交付计划。"
 
 将 `tool` 放入 `Agent(tools=[tool], ...)`；需要可信用户/树作用域、私有审计等资源时使用 `tool_factory(ToolContext)` 为每个任务创建注册项，不把任务身份放入模型参数。
 
+默认参数解析器按工具的 Pydantic Schema 解码模型输出的对象和数组，包括多编码成 JSON 文本的字段。对带 discriminator 的联合类型，解析器只处理标签选定分支的字段。普通文本按原值传入，后续业务类型校验继续生效。
+
 所有字段（含嵌套和动态属性）必须具有准确 description；注册时检查实际 JSON Schema。工具主体返回结构化结果，末尾 `FeedbackOnlyHook` 只渲染正文。业务钩子按工具独立、顺序运行，不能修改执行状态；失败同样提供友好反馈。
 
 外部写操作须自行支持幂等，可信调用 ID 可从 `core.tool.registry.current_tool_call_id` 取得。`persist_result=True` 可随检查点保存结构化结果。`ToolExecution.after_commit` 只在提交成功后执行；它不是跨数据库分布式事务。可靠外部交付仍应由宿主提供 outbox/幂等接口，禁止把提交后网络发送描述为原子保证。
