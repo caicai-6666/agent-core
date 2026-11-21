@@ -1,16 +1,53 @@
+# 默认忽略，只跟踪发布本库所需的源码、资源、正式文档及目录占位。
+*
+
+!/.gitignore
+!/.env.example
+!/AGENTS.md
+!/README.md
+!/pyproject.toml
+!/MANIFEST.in
+
+# Python 包和构建入口；包数据与 pyproject.toml 保持一致。
+!/src/
+!/src/build_support.py
+!/src/agent_core/
+!/src/agent_core/**/
+!/src/agent_core/**/*.py
+!/src/agent_core/py.typed
+!/src/agent_core/assets/tool-tag/*.txt
+
+# README 中公开的可运行示例。
+!/examples/
+!/examples/minimal.py
+!/description/
+!/description/**/
+!/description/**/*.md
+
+# 测试代码、样本及实验产物留在本机，只提交必要目录占位。
+!/tests/
+!/tests/fixtures/
+!/tests/fixtures/.gitkeep
+!/tests/tmp/
+!/tests/tmp/.gitkeep
+!/experiment/
+!/experiment/.gitkeep
+
+# 放行目录内也排除本地配置、生成目录和编辑器文件。
+.env
+.env.*
+!/.env.example
 __pycache__/
 *.py[cod]
 .venv*/
 .pytest_cache/
-.idea/
-.vscode/
-.DS_Store
 *.egg-info/
 build/
 dist/
-.env
-.env.*
-!.env.example
-*.sqlite*
-experiment/
-tests/tmp/
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.tmp
+*.swp
+*~
