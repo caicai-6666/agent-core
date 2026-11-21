@@ -104,14 +104,18 @@ class AgentCore:
             'enable_thinking':effort!='none','reasoning_effort':effort if effort!='none' else 'low'})
 
     async def _invoke(self,client,journal,messages,tools,generation,purpose,*,json_schema=None,on_tool_delta=None):
+        control = getattr(journal, 'control', None)
+        if control:
+            control.checkpoint()
         chunks=[]
         async def raw(chunk):
             chunks.append(deepcopy(chunk))
         try:
-            response=await client.create_chat_completion(messages=deepcopy(messages),tools=deepcopy(tools),
+            request=client.create_chat_completion(messages=deepcopy(messages),tools=deepcopy(tools),
                 tool_choice='auto',generation=generation,stream=True,on_raw_chunk=raw,
                 **({'json_schema':json_schema} if json_schema is not None else {}),
                 **({'on_tool_delta':on_tool_delta} if on_tool_delta is not None else {}))
+            response = await control.generate(request) if control else await request
         except BaseException as error:
             # 不自动重放请求；取消也先尽力保留已接收分片。持久化失败不掩盖原异常。
             try:
@@ -273,6 +277,8 @@ class AgentCore:
             if output_observer is not None:await output_observer.begin()
             response=await self._invoke(client,journal,messages,tools,generation,'main',
                 on_tool_delta=output_observer.on_delta if output_observer is not None else None)
+            if getattr(journal, 'control', None):
+                journal.control.checkpoint()
             pages.consume(shown,finish_reason=response.finish_reason)
             if journal.status!='generating':
                 raise AgentCoreError('任务已结束，丢弃迟到业务动作')
@@ -379,6 +385,9 @@ class AgentCore:
                     raise AgentCoreError('连续工具校验失败达到上限')
                 continue
             # 执行或提交故障直接停止，不当作模型参数错误反复调用外部服务。
+            control = getattr(journal, 'control', None)
+            if control:
+                control.before_tool(final=self.registry.entries[call.name].output_kind == 'final')
             try:
                 execution = await self.registry.execute(
                     call.name,
@@ -421,6 +430,8 @@ class AgentCore:
             pair=[assistant,receipt]
             guidance=[{**item.message,'source':item.source} for item in result.system_guidence]
             if result.status=='failed':
+                if control:
+                    control.finishing = False
                 if output_observer is not None:await output_observer.interrupt()
                 if result.failure_mode == 'failed':
                     # 执行失败是已确认的事实，保留回执供模型诚实说明；不接受候选工作区或成功回调。

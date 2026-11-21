@@ -17,14 +17,14 @@ from agent_core.providers import ExpertReply
 from agent_core.infrastructure.mllm import _completion
 from agent_core.storage import Write, MemoryDocument
 from agent_core.tasks import PersistentJournal
-from agent_core.memory import Memory
+from agent_core.memory import Memory, public_sources
 from agent_core.core.subgraph.memory_retrieval.schema import RetrievalPlan, FieldQuery
 
 
 def response(name='finish_task', arguments=None, identity='call'):
     return _completion({'id':'test', 'model':'test', 'choices':[{'finish_reason':'tool_calls',
         'message':{'role':'assistant', 'content':'PRIVATE-NOTE', 'tool_calls':[{'id':identity,'type':'function',
-        'function':{'name':name,'arguments':json.dumps(arguments or {'content':'测试完成'}, ensure_ascii=False)}}]}}], 'usage':{}})
+        'function':{'name':name,'arguments':json.dumps(arguments if arguments is not None else {'content':'测试完成'}, ensure_ascii=False)}}]}}], 'usage':{}})
 
 
 class Embedding:
@@ -333,3 +333,172 @@ async def test_cached_result_preserves_delivery_failure(storage):
     assert result.delivery_error_type=='OSError'
     cached=await agent.run('交付失败',owner='a',tree_id='delivery',task_id='a1'*16)
     assert cached.delivery_error_type=='OSError' and len(client.inputs)==1
+
+
+async def test_idle_heartbeat_prunes_only_silent_first_round(storage):
+    from agent_core import SchedulerSettings
+    silent = {'content': '没有待办', 'send_to_user': False, 'prune_current_task': True}
+    agent, client, _ = make(storage, [response(), response(arguments=silent)])
+    repo = agent.repository('alice', 'heart')
+    await agent.run('建立上下文', owner='alice', tree_id='heart', task_id='1'*32)
+    old_tree = await storage.read(repo.scope, 'tree')
+    send = AsyncMock()
+    config = SchedulerSettings(heartbeat_interval_seconds=60, heartbeat_message='检查项目待办')
+    scheduler = agent.scheduler(owner='alice', tree_id='heart', settings=config, publish=send)
+    result = await scheduler.tick()
+    assert result.answer == '没有待办'
+    tree = await storage.read(repo.scope, 'tree')
+    assert tree.value['tasks'] == old_tree.value['tasks'] and tree.value['head'] == '1'*32
+    assert (await storage.read(repo.scope,'heartbeat')).value['last_heartbeat_at'] and tree.value['active'] is None
+    assert '系统心跳检查' in str(client.inputs[-1]['messages'])
+    assert '检查项目待办' in str(client.inputs[-1]['messages'])
+    send.assert_not_awaited()
+    assert await scheduler.tick() is None
+    # 冷启动只保留去重账本，当前心跳无节点、生成、审计或记忆索引。
+    keys = dict(storage._db.execute('SELECT key,value FROM records WHERE scope=?', (repo.scope,)))
+    marker, = [key for key in keys if key.startswith('pruned:')]
+    assert marker.replace('pruned:', 'task:') not in keys
+    assert len([k for k in keys if k.startswith('generation:')]) == 1
+    assert len([k for k in keys if k.startswith('audit:')]) == 1
+    await agent.close()
+    restarted, _, _ = make(storage, [])
+    assert await restarted.scheduler(owner='alice', tree_id='heart', settings=config).tick() is None
+    with pytest.raises(StorageConflict):
+        await restarted.run('重复', owner='alice', tree_id='heart', task_id=marker[7:])
+    await restarted.close()
+
+
+async def test_heartbeat_after_tool_keeps_evidence(storage):
+    from agent_core import SchedulerSettings
+    silent = {'content':'核对完成', 'send_to_user':False, 'prune_current_task':True}
+    agent, client, _ = make(storage, [response('get_current_time', {}, 'a'),
+        response(arguments=silent, identity='b'), response(arguments={**silent, 'prune_current_task':False}, identity='c')])
+    repo = agent.repository('alice', 'keep')
+    await agent.scheduler(owner='alice', tree_id='keep', settings=SchedulerSettings(heartbeat_interval_seconds=30)).tick()
+    assert '本次已有其他交互' in str(client.inputs[-1]['messages'])
+    tree = await storage.read(repo.scope, 'tree')
+    task, _ = await repo.load(tree.value['head'])
+    assert task.source == 'heartbeat' and len(task.generation_ids) == 3
+    assert '本次已有其他交互' not in str(task.exchanges)
+    assert task.question not in [s[2] for s in public_sources(task)]
+    await agent.close()
+
+
+async def test_reminder_checkpoint_due_restart_and_deletion(storage):
+    from datetime import datetime, timedelta, timezone
+    from agent_core.scheduler import Reminders
+    now = datetime.now(timezone.utc)
+    args = {'content':'核对库存', 'schedule_type':'once',
+            'schedule_config':{'at':(now + timedelta(days=1)).isoformat()}}
+    agent, client, _ = make(storage, [
+        response('create_reminder',{**args, 'schedule_config':{'at':(now-timedelta(days=1)).isoformat()}},'bad'),
+        response('create_reminder',args,'create'), response('list_reminders',{'offset':0},'list'), response()
+    ], reminder_tools=True)
+    await agent.run('明天核对库存', owner='u',tree_id='t')
+    assert '没有未来触发时间' in str(client.inputs[1]['messages'])
+    assert '提醒已创建' in str(client.inputs[2]['messages'])
+    assert '没有未来触发时间' not in str(client.inputs[2]['messages'])
+    assert '核对库存' in str(client.inputs[3]['messages'])
+    repo = agent.repository('u','t')
+    reminders = Reminders(repo)
+    row, = await reminders.list_current(offset=0,limit=10)
+    await reminders.materialize_due(now + timedelta(days=2))
+    await agent.close()
+    agent, client, _ = make(storage, [response('delete_reminder',{'reminder_id':row.id},'del'),response(),
+        response(arguments={'content':'测试完成','send_to_user':False})],reminder_tools=True)
+    await agent.run('取消后续提醒',owner='u',tree_id='t')
+    assert (await reminders.find(row.id)).status == 'cancelled'
+    scheduler = agent.scheduler(owner='u',tree_id='t')
+    assert (await scheduler.tick()).answer == '测试完成'
+    assert '## 定时任务' in str(client.inputs[-1]['messages'])
+    assert await scheduler.tick() is None
+    await agent.close()
+
+
+async def test_competing_schedulers_and_failed_pruning_transaction(storage, monkeypatch):
+    from agent_core import SchedulerSettings
+    silent = {'content':'无需处理','send_to_user':False,'prune_current_task':True}
+    config = SchedulerSettings(heartbeat_interval_seconds=60)
+    agents = [make(storage, [response(arguments=silent)])[0] for _ in range(2)]
+    results = await asyncio.gather(*(a.scheduler(owner='race',tree_id='t',settings=config).tick()
+                                    for a in agents), return_exceptions=True)
+    assert sum(getattr(r, 'answer', None) == '无需处理' for r in results) == 1
+    assert all(r is None or isinstance(r, StorageConflict) or getattr(r,'answer',None) for r in results)
+    for a in agents:
+        await a.close()
+
+    original = storage.atomic
+    async def conflict(scope, writes):
+        if any(w.key.startswith('pruned:') for w in writes):
+            # 批次末尾强制版本冲突，确认之前的 DELETE 与树指针一同回滚。
+            writes = [*writes, Write('absent', 99, {})]
+        return await original(scope, writes)
+    monkeypatch.setattr(storage,'atomic',conflict)
+    agent, _, _ = make(storage,[response(arguments=silent)])
+    repo = agent.repository('rollback','t')
+    scheduler = agent.scheduler(owner='rollback',tree_id='t',settings=config)
+    with pytest.raises(AgentCoreError):
+        await scheduler.tick()
+    tree = await storage.read(repo.scope,'tree')
+    identifier = (await storage.read(repo.scope,'heartbeat')).value['heartbeat_pending']
+    task, _ = await repo.load(identifier)
+    assert task.status == 'failed' and tree.value['head'] == identifier
+    assert await storage.read(repo.scope,'generation:'+task.generation_ids[0])
+    assert await storage.read(repo.scope,'checkpoint:'+task.checkpoint_ids[0])
+    assert not await storage.read(repo.scope,'pruned:'+identifier)
+    assert await scheduler.tick() is None
+    await repo.acknowledge_heartbeat(identifier)
+    assert (await storage.read(repo.scope,'heartbeat')).value['heartbeat_pending'] is None
+    await agent.close()
+
+
+async def test_background_scheduler_default_off_and_custom_message(storage):
+    from agent_core import SchedulerSettings
+    from agent_core.scheduler import HEARTBEAT_MESSAGE
+    agent, client, _ = make(storage, [response(arguments={'content':'有待办','send_to_user':True})])
+    disabled = agent.scheduler(owner='u', tree_id='disabled')
+    assert await disabled.tick() is None and not client.inputs
+    delivered = asyncio.Event()
+    async def publish(kind, text):
+        assert (kind, text) == ('final','有待办')
+        delivered.set()
+    service = agent.scheduler(owner='u', tree_id='enabled',
+        settings=SchedulerSettings(heartbeat_interval_seconds=60), publish=publish)
+    service.start()
+    await asyncio.wait_for(delivered.wait(), 2)
+    await agent.close()
+    assert HEARTBEAT_MESSAGE in str(client.inputs[0]['messages'])
+    assert len(client.inputs) == 1 and not agent._schedulers
+
+
+def test_calendar_dst_gap_and_missing_month_day():
+    from datetime import datetime
+    from agent_core.reminder_schedule import next_occurrence
+    from agent_core.reminder_tools import parse_create_reminder
+    def next_time(after, **rule):
+        args = parse_create_reminder(json.dumps({'content':'检查待办','timezone':'America/New_York',
+            'schedule_type':'calendar','schedule_config':{'start_date':'2026-01-01', **rule}}))
+        return next_occurrence(args.schedule_config, args.timezone, datetime.fromisoformat(after))
+    assert next_time('2026-03-08T00:00:00-05:00',frequency='daily',local_time='02:30:00').isoformat() == '2026-03-09T06:30:00+00:00'
+    assert next_time('2026-02-01T00:00:00-05:00',frequency='monthly',day_of_month=31,
+                     missing_day='last_day',local_time='09:00:00').day == 28
+
+
+async def test_reminder_create_rollback(storage, monkeypatch):
+    agent, client, _ = make(storage, [response('create_reminder',{'content':'核查',
+        'schedule_type':'once','schedule_config':{'at':'2099-05-01T10:00:00+08:00'}})],reminder_tools=True)
+    original = storage.atomic
+    async def conflict(scope, writes):
+        if any(w.key == 'reminders' for w in writes):
+            writes = [*writes, Write('absent', 99, {})]
+        return await original(scope, writes)
+    monkeypatch.setattr(storage,'atomic',conflict)
+    with pytest.raises(AgentCoreError):
+        await agent.run('安排核查',owner='alice',tree_id='rollback')
+    repo = agent.repository('alice','rollback')
+    assert await storage.read(repo.scope,'reminders') is None
+    assert len(client.inputs) == 1
+    schema = next(t['function']['parameters'] for t in client.inputs[0]['tools'] if t['function']['name']=='create_reminder')
+    assert all(field['description'] for definition in [schema,*schema['$defs'].values()]
+               for field in definition['properties'].values())
+    await agent.close()

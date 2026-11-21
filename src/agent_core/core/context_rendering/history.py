@@ -12,6 +12,7 @@ def render_history(context: ContextInjection):
 
 def render_turn(turn):
     result=turn.model_dump(mode='json',exclude={'status','native_messages'})
+    if turn.source == 'user':result.pop('source', None)
     if result['created_at'] is None:result.pop('created_at')
     if not result['attachments']:result.pop('attachments')
     if turn.native_messages is not None:
@@ -29,7 +30,7 @@ def render_history_messages(context: ContextInjection):
     summary=render_summary_section(context.summary)
     if summary:messages.append({'role':'user','content':summary})
     for number,turn in enumerate(context.turns,1):
-        messages.append({'role':'user','content':render_task_input(turn.question,task_number=number,attachments=turn.attachments,created_at=turn.created_at)})
+        messages.append({'role':'user','content':render_task_input(turn.question,source=turn.source,task_number=number,attachments=turn.attachments,created_at=turn.created_at)})
         projected=render_turn(turn)
         native=projected.get('native_messages')
         if native is not None:

@@ -13,13 +13,13 @@ from .core.native_messages import messages_from_exchanges
 
 def public_fields(task):
     # 与当前项目一致：三路公开来源；模型思考与私有审计绝不进入记忆索引。
-    return {'user_input': task.question,
+    return {'user_input': task.question if task.source == 'user' else '',
             'intermediate_output': '\n\n'.join(text for kind,text in task.outputs if kind == 'intermediate'),
             'final_output': '\n\n'.join(text for kind,text in task.outputs if kind == 'final') if task.status == 'complete' else ''}
 
 
 def public_sources(task):
-    sources = [('user_input', task.id, task.question)]
+    sources = [('user_input', task.id, task.question)] if task.source == 'user' else []
     if len(task.output_ids) != len(task.outputs):
         raise ValueError('公开消息缺少稳定来源 ID')
     for identifier, (kind, text) in zip(task.output_ids, task.outputs):
@@ -107,7 +107,7 @@ class Memory:
                     raise ValueError('资料不在当前父链范围')
                 task, _ = await self.repository.load(identifier)
                 fields = public_fields(task)
-                content = SimpleNamespace(question=task.question, answer=fields['final_output'],
+                content = SimpleNamespace(question=fields['user_input'], answer=fields['final_output'],
                     exchanges=task.exchanges, attachments=[AttachmentReference.model_validate(a) for a in task.attachments])
                 messages = [SimpleNamespace(kind=kind, text=text) for kind,text in task.outputs]
                 tasks.append(SimpleNamespace(write=SimpleNamespace(node=task, content=content), messages=messages))

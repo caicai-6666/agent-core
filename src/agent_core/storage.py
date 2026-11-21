@@ -17,7 +17,7 @@ class Record:
 class Write:
     key: str
     expected: int | None
-    value: dict
+    value: dict | None  # None 表示按 expected 版本原子删除，用于空转心跳裁剪。
 
 
 @dataclass(frozen=True)

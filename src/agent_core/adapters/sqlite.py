@@ -20,6 +20,8 @@ from ..vectors import validate_vector
 
 
 class SQLiteStorage:
+    supports_atomic_delete = True
+
     def __init__(self, path):
         self.path = str(path)
         self._lock = asyncio.Lock()
@@ -66,6 +68,11 @@ class SQLiteStorage:
                     actual = row[0] if row else None
                     if actual != write.expected:
                         raise StorageConflict('存储版本冲突，操作未提交')
+                    if write.value is None:
+                        if actual is None:
+                            raise StorageConflict('待删记录不存在')
+                        self._db.execute('DELETE FROM records WHERE scope=? AND key=?', (scope, write.key))
+                        continue
                     self._db.execute('INSERT INTO records VALUES (?,?,?,?) ON CONFLICT(scope,key) DO UPDATE SET version=excluded.version,value=excluded.value',
                         (scope, write.key, (actual or 0) + 1, json.dumps(write.value, ensure_ascii=False, allow_nan=False)))
                 self._db.commit()

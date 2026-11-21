@@ -4,7 +4,7 @@ from .block import text_block,metadata_block
 from .attachment import render_attachments
 
 
-def render_task_input(question,*,task_number,attachments=(),supplemental='',platform_permissions=None,created_at=None):
+def render_task_input(question,*,task_number,source='user',attachments=(),supplemental='',platform_permissions=None,created_at=None):
     if type(task_number) is not int or task_number<1:raise ValueError('展示序号必须为正整数')
     if not isinstance(question,str) or not question.strip():raise ValueError('用户问题不能为空')
     # 序号只表示本次上下文中的阅读顺序，不使用持久化节点编号。
@@ -15,7 +15,10 @@ def render_task_input(question,*,task_number,attachments=(),supplemental='',plat
             raise ValueError('任务创建时间必须包含时区')
         stamp=created_at.astimezone(timezone(timedelta(hours=8))).isoformat(timespec='milliseconds')
         lines.append(f'任务创建时间：{stamp}（北京时间）')
-    lines+=['','## 用户输入','','### 用户问题','',text_block(question)]
+    if source == 'user':
+        lines+=['','## 用户输入','','### 用户问题','',text_block(question)]
+    else:
+        lines+=['', '## ' + {'business':'业务系统任务','heartbeat':'系统心跳检查','reminder':'定时任务'}[source], '', text_block(question)]
     attachment_text=render_attachments(attachments)
     if attachment_text:
         lines+=['',attachment_text]

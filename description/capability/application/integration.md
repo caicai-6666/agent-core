@@ -138,3 +138,75 @@ async with aclosing(agent.stream("任务", owner=user_id, tree_id=tree_id)) as e
 先用 `agent.repository(owner, tree_id).load(task_id)` 查看权威状态。进程崩溃后，确认旧执行器已停止，再调用 `agent.recover(...)` 将在途任务转为失败并释放树；用户已取消或调整方向时可明确指定 `status="cancelled"` 或 `status="superseded"`，保留相应终态语义。库保留已提交轨迹和私有审计，不自动重放可能已执行的工具。
 
 新任务将读取已确认的工作区、完整历史、终态语义和压缩窗口。需要继续业务时创建后续任务，并在涉及外部写操作前核实未确认动作的实际状态。幂等任务 ID 不等于任意外部工具自动具备 exactly-once 语义。
+
+---
+
+## 空闲心跳与定时任务
+
+高层 `Agent` 沿用个人助理的空闲心跳、静默裁剪和提醒工具。宿主显式绑定已授权的用户及任务树，在运行中的异步事件循环启动调度器。普通接入默认关闭这两项能力。
+
+```python
+from agent_core import Agent, SchedulerSettings
+
+agent = Agent(models=models, storage=store, role=role, reminder_tools=True)
+scheduler = agent.scheduler(
+    owner=user_id,
+    tree_id=conversation_id,
+    settings=SchedulerSettings(
+        heartbeat_interval_seconds=1800,
+        heartbeat_message="请检查当前项目的待办和已有进展。",
+        poll_seconds=30,
+    ),
+    publish=publish,  # 可选异步函数，签名为 publish(kind, text)
+)
+scheduler.start()
+# 服务退出时先等待在途任务结束，再关闭宿主持有的数据库及模型连接。
+await agent.close()
+```
+
+- **心跳**：`heartbeat_interval_seconds=-1` 关闭，正整数开启。首次空闲扫描即可触发，以最近一次确认完成的心跳计时。省略 `heartbeat_message` 时使用“请结合已有记忆、工作区和待办，检查现在是否有值得推进、核查或整理的事项。”任务输入和历史均标记为系统心跳，记忆索引中仅收录该任务的公开输出。
+- **定时任务**：`reminder_tools=True` 注册 `create_reminder`、`list_reminders`、`delete_reminder`。支持一次性、固定秒数间隔以及按时区的日、周、月排期。默认时区为 Asia/Shanghai。月末缺日策略需明确选择；夏令时跳过不存在的时刻，重复时刻取第一次。创建或取消与工具检查点一起提交。已入队的提醒保留，停机错过多个周期时合并为一次。仅使用提醒时，保留心跳间隔默认值并启动调度器。
+- **运行方式**：可以让宿主周期性等待 `scheduler.tick()` 代替 `start()`；一次检查最多执行一个到期任务。按已登记的任务树逐个恢复调度器，提醒排期、队列与心跳确认时间从数据库恢复。到期提醒优先，当前执行中的任务继续运行。库使用同一存储适配器完成入队与领取，外部员工目录、消息中间件和钉钉交付由宿主接入。业务系统另有用户消息积压时，应在业务队列空闲后调用 `tick()`。
+- **收尾与裁剪**：默认结束工具通过 `send_to_user` 决定是否调用宿主交付回调。空转心跳可在首次主生成中用 `finish_task(content="无新事项", send_to_user=false, prune_current_task=true)` 静默裁剪。已执行其他工具、产生额外生成或摘要、发生纠错、修改业务工作区、携带附件或需要通知时，保留该轮。模型可根据拒绝反馈改为正常结束。宿主自定义结束工具或附加结束钩子时沿用其交付行为，标准静默裁剪仅用于库可验证的默认结束工具。
+- **故障处理**：心跳执行失败、进程崩溃或交付未确认时，后续心跳等待宿主核实。通过该作用域 `heartbeat` 记录的 `heartbeat_pending` 定位任务；若仍在执行态，先按故障恢复流程终止旧执行，再在确认处理结果后调用 `await agent.repository(user_id, tree_id).acknowledge_heartbeat(task_id)`。确认操作启动下一个间隔。存储事务和裁剪适配方式见[存储契约](../../architecture/data/storage.md#调度与心跳裁剪)。
+
+---
+
+## 统一会话运行时
+
+业务系统在同一事件循环复用 `agent.sessions`。先选择会话形态，再选择执行模式；由宿主认证并传入可信 owner。首次绑定持久树时保存执行模式，重启按同一模式重新绑定。
+
+| 入口 | 上下文与轨迹 |
+| --- | --- |
+| `await agent.sessions.persistent(owner=..., tree_id=..., mode=...)` | 使用宿主存储。按已提交父节点复用内存快照，冷启动从任务树恢复。 |
+| `await agent.sessions.memory(owner=..., context=..., mode=...)` | 使用会话独享的内存 SQLite，初始上下文可省略。释放时关闭内存库，纯内存应用可省略 Agent 的 storage 参数。 |
+| `await agent.sessions.fork(parent, task_id=..., tools=..., mode=...)` | 从持久本体指定的已结束节点复制快照。默认取当前已提交 head，本体在途期间可咨询。后续轮次、工作区、审计、索引均在分身内存中。 |
+
+三个入口均支持通过 `tools` 增加会话级注册项，沿用 Agent 的角色、模型和业务工具。工具可执行宿主授权的业务写入。分身复用本体的提醒仓库，提醒先落到本体，再向分身提交内存回执。两种存储之间没有分布式事务；提交结果不明时应回查本体提醒列表。本体调度器到点后在本体上下文中执行。纯内存会话的提醒随该会话释放。
+
+### 提交、插队与打断
+
+```python
+session = await agent.sessions.persistent(
+    owner=user_id, tree_id=conversation_id, mode="interruptible",
+)
+task = await session.submit("整理供应商报价")
+# 业务事件保留真实来源。priority 越大越靠前，同级按入队顺序。
+event_task = await session.submit("项目审批已通过", source="business", priority=10)
+# 在另一请求中明确替代仍在执行的 task；宿主保留原任务 ID。
+replacement = await session.submit("改为只比较 A 和 B", replace_task_id=task.id)
+async for event in replacement.events():
+    yield event.sse()
+```
+
+- 默认 `mode="queue"` 始终等待当前任务收尾。高优先级仅改变等待顺序。
+- `mode="interruptible"` 同样对普通提交排队。`await session.stop(task_id)` 等待停止并返回终态；`replace_task_id` 在旧任务确认 `superseded` 后优先接续。迟到的指令被拒绝，已进入最终工具收尾时以该工具的实际结果为准。可从运行时任务的 `task.started` 事件或 `session.active_task_id` 获取当前执行标识。
+- 停止时取消主模型生成；已进入的工具继续至结果与检查点确认。工具执行结果不确定时，旧任务失败，依赖其成功替代的指令不会开始。已提交的外部写入保留。工具自行阻塞时，安全切换需要等待工具返回。
+- `await task.result()` 返回 `AgentResult`，已打断任务抛出带终态的 `TaskInterrupted`。`task.events()` 可订阅任一模式，断开订阅后执行继续。提交时传入 `preview=False` 可关闭候选正文预览，进度与已提交输出仍可观察。每个句柄保留最近 256 个事件，超窗时回查结果。旧的 `agent.stream()` 仍沿用断流取消契约。
+- `session.scheduler(...).start()` 显式开启已有心跳或提醒调度。等待中的业务输入优先，调度不抢占。冻结分身取得本体的调度器；内存会话的调度器随会话关闭。
+
+### 驻留与部署
+
+Agent 的 `session_capacity` 默认 100，`session_ttl_seconds` 默认 1800。运行时自动清理空闲会话；达到容量上限时先驱逐最久未用的空闲会话，全部活跃则返回冲突。执行、排队与快照读取期间保护对应会话。宿主也可显式 `await agent.sessions.release(session)`。使用 `await agent.sessions.get(owner=..., session_id=...)` 续接驻留会话，内存会话和分身释放后返回 `SessionExpired`。
+
+同一会话的提交、SSE 与停止请求应路由到同一运行进程。任务领取依赖数据库版本校验；跨进程竞争后本地句柄可以回查持久终态，实时分片与取消信号由执行进程持有。持久会话重新绑定会继续未领取的队列，崩溃遗留的活动任务须确认旧执行器停止后走 `agent.recover()`。内存会话的队列随进程结束。需要排队和打断时使用 `session.submit()`；原有直接调用 `agent.run()` 的忙时冲突语义保留。

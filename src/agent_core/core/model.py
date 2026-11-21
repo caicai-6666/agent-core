@@ -17,6 +17,7 @@ class CoreModel(BaseModel):
 
 class HistoryTurn(CoreModel):
     created_at: AwareDatetime | None = Field(default=None, description="历史任务的原始创建时间；未知时为空，不以当前时间代替。")
+    source: Literal['user', 'business', 'heartbeat', 'reminder'] = 'user'
     question: str = Field(strict=True,min_length=1)
     attachments: list[AttachmentReference] = Field(default_factory=list)
     intermediate: list[str] = Field(default_factory=list)
@@ -46,6 +47,7 @@ class AgentInput(CoreModel):
     # 独立Core输入只采集一次；持久化宿主在执行前绑定实际节点时间。
     created_at: AwareDatetime = Field(default_factory=lambda: datetime.now(timezone.utc),
         description="本次任务创建时间，由宿主绑定；用于相对日期，不是业务事件发生时间。")
+    source: Literal['user', 'business', 'heartbeat', 'reminder'] = 'user'
     question: str = Field(strict=True,min_length=1,pattern=r'\S')
     attachments: list[AttachmentReference] = Field(default_factory=list,description='当前用户任务的附件引用，按输入顺序展示。')
     context: ContextInjection = Field(default_factory=ContextInjection)

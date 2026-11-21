@@ -13,6 +13,7 @@ pip install "agent-core @ git+https://github.com/caicai-6666/agent-core.git@v0.1
 本地源码也可使用 `pip install /path/to/agent-core`。访问私有仓库时需要先配置 GitHub 认证；安装地址中不要填写凭据。
 
 - [接入指南](description/capability/application/integration.md)：三个模型、业务角色、工具与普通/流式调用。
+- [统一会话运行时](description/capability/application/integration.md#统一会话运行时)：持久会话、内存会话、冻结分身、优先级队列及可打断交互。
 - [数据库适配契约](description/architecture/data/storage.md)：原子提交、任务树、记忆检索与故障恢复。
 - [机制迁移清单](description/architecture/system/mechanisms.md)：现有机制如何保留以及业务边界。
 - [可运行示例](examples/minimal.py)：无需模型服务器的确定性示例。

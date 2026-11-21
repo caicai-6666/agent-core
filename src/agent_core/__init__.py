@@ -11,3 +11,6 @@ from .core.tool import FinishTaskTool, OutputArguments
 from .core.tool.hooks import FeedbackOnlyHook
 from .providers import VLLMClient, VLLMSettings, GenerationSettings, VLLMEmbedding
 from .tools import build_progress_tool
+from .scheduler import SchedulerSettings
+
+from .sessions import SessionRuntime, Session, SessionTask, SessionExpired, TaskInterrupted

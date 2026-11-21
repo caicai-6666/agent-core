@@ -9,7 +9,7 @@ from .workspace import render_workspace_section
 
 
 def render_current_input(request: AgentInput):
-    return render_task_input(request.question,task_number=len(request.context.turns)+1,
+    return render_task_input(request.question,source=request.source,task_number=len(request.context.turns)+1,
         attachments=request.attachments,supplemental=request.context.supplemental,
         platform_permissions=request.platform_permissions,created_at=request.created_at)
 
