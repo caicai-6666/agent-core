@@ -4,6 +4,7 @@ from textwrap import dedent
 from ...json_codec import render_json, ModelActionRejected
 from ...workspace import empty_workspace
 from ...context_budget import validate_count
+from ...tool.retry import ToolFailureTracker
 from ...tool.registry import check_descriptions
 from .prompt import build_prompt
 from .tool import FileRetrievalToolSession
@@ -19,6 +20,7 @@ async def run_retrieval(query, *, pool, search, generate, counter, generation, c
     prefix=[{'role':'system','content':build_prompt(tool_template)},
             {'role':'user','content':'文件查找需求：'+render_json(query)}]
     history,recovery=[],[]
+    failures = ToolFailureTracker(3)
     for _ in range(max_rounds):
         messages=deepcopy(prefix+history+recovery)
         if validate_count(await counter(messages,tools,generation))+generation.max_completion_tokens>context_window:
@@ -26,6 +28,7 @@ async def run_retrieval(query, *, pool, search, generate, counter, generation, c
         response=await generate(messages,tools,generation)
         valid=(response.finish_reason in ('stop','tool_calls') and not response.assistant_message.get('refusal')
                and len(response.tool_calls)==1)
+        name = response.tool_calls[0].name if valid and response.tool_calls[0].name in registry.entries else None
         try:
             if not valid:
                 raise ModelActionRejected('本轮未提交唯一完整且未被拒绝的工具调用，未执行操作。',
@@ -50,10 +53,12 @@ async def run_retrieval(query, *, pool, search, generate, counter, generation, c
         if feedback['status']=='error':
             if feedback.get('fatal'):
                 raise ModelActionRejected(feedback['message'], feedback['required_action'])
+            text = failures.feedback(text, name, feedback.get('error_code') or feedback['message'])
             recovery.append({'role':'user','content':text})
             if len(recovery)>=3:
                 raise ModelActionRejected('文件检索连续纠错达到上限，本次查询未完成。', '请明确文件线索并缩小条件后重新检索，不复用本次内部候选 ID。')
             continue
+        failures.success(name)
         recovery.clear()
         if feedback.get('finished'):
             return session.result

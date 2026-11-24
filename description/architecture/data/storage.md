@@ -4,6 +4,38 @@
 
 ---
 
+## 数据库准备
+
+SQLite 与 MySQL 使用相同的权威记录和记忆文档语义。发布包携带[SQLite 建表脚本](../../../src/agent_core/adapters/schema/sqlite.sql)和[MySQL 建表脚本](../../../src/agent_core/adapters/schema/mysql.sql)。由宿主在部署阶段执行相应脚本。SQLite 需要 FTS5，MySQL 需要 InnoDB 与支持 JSON 的 MySQL 8+。MySQL 宿主安装 `agent-core[mysql]` 并创建 `asyncmy` 连接池。
+
+```python
+import sqlite3
+from agent_core import MySQLStorage, SQLiteStorage, schema_sql
+
+# 部署或升级未标版本的旧 SQLite 数据库时执行一次。
+with sqlite3.connect(database_path) as conn:
+    conn.executescript(schema_sql("sqlite", from_version=0))
+
+# 业务启动时选择一种绑定。
+database = SQLiteStorage.connect(database_path)
+# database = await MySQLStorage.connect(pool)
+```
+
+`agent_core_schema` 登记结构版本，当前为 1。两种 `connect` 都检查版本、必需列类型和唯一键。部署脚本可重复执行；旧 SQLite 表保留数据和扩展列。兼容构造器 `SQLiteStorage(path)` 仍可为旧调用者自动准备本地库。MySQL 连接池由宿主负责关闭。
+
+| 表 | 用途 | 唯一键 |
+|---|---|---|
+| records | 树、节点、工作区、队列、外部输入收据及检查点 | scope、key |
+| spaces | 记忆向量空间与维度 | scope |
+| memory | 公开记忆来源及向量索引 | scope、task_id、source_id |
+| file_notes | 按作用域隔离的文件备忘（文件名、摘要与更新时间） | scope、file_id |
+
+SQLite 另有 `memory_fts` 支撑记忆 BM25 检索、`file_notes_fts` 支撑文件备忘全文检索。MySQL 版在已授权候选范围内计算记忆 BM25 和精确余弦排名，再以 RRF 合并，适用于候选集可在内存处理的规模；`file_notes` 则使用 `name` 与 `summary` 的 ngram FULLTEXT 索引。
+
+业务方可为上述四张业务表扩展列。可空列和具有默认值的列可直接增加；无默认值的必填列通过 `insert_fields(table, core_row) -> dict` 提供新行的业务值，两种 `connect` 都支持该回调。回调须同步、可重复执行且无副作用。列名与核心字段独立，值以 SQL 参数绑定。库只对创建行调用回调，更新已有行只改核心列。显式删除或心跳裁剪整行时，该行的扩展值随之删除。
+
+---
+
 ## 权威存储
 
 `read(scope, key)` 返回 `Record(version, value)` 或 None，必须是独立快照，不得暴露共享可变对象。

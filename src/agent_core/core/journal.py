@@ -35,32 +35,6 @@ class MemoryJournal:
         self.generations.append(event)
         await self._save_generation(event)
 
-    async def record_expert(self, event):
-        """完整 Responses 及提交状态保留在私有生成中，不作为主助手历史回传。"""
-        response = deepcopy(event.get('response'))
-        state = event['status']
-        messages = [item for item in (response or {}).get('output', ()) if item.get('type') == 'message']
-        generation = NodeGeneration(node_id=self.node_id,
-            status='complete' if state == 'success' else 'cancelled' if state == 'cancelled' else 'failed',
-            payload=GenerationPayload(purpose='external_expert',
-                assistant_message=messages[-1] if messages else None, raw_response=response,
-                raw_chunks=[deepcopy(event)], usage=(response or {}).get('usage') or {},
-                finish_reason=(response or {}).get('status'), error_type=event.get('error_type')))
-        self.generations.append(generation)
-        await self._save_generation(generation)
-
-    async def record_web_refinement(self, event):
-        """网页精炼原生响应完整保存；模型输出校验失败也不截断或丢弃审计。"""
-        message = event.get('assistant_message')
-        generation = NodeGeneration(node_id=self.node_id,
-            status='complete' if message is not None else 'cancelled' if event.get('status') == 'cancelled' else 'failed',
-            payload=GenerationPayload(purpose='web_page_refinement', assistant_message=deepcopy(message),
-                raw_response=deepcopy(event.get('response')), raw_chunks=[deepcopy(event)],
-                usage=event.get('usage') or {}, finish_reason=event.get('finish_reason'),
-                error_type=event.get('error_type')))
-        self.generations.append(generation)
-        await self._save_generation(generation)
-
     async def record_file_retrieval(self, event):
         """保留子检索完整反馈，成功后的模型上下文可以清除连续失败轨迹。"""
         generation = NodeGeneration(node_id=self.node_id, status='complete',

@@ -1,6 +1,6 @@
 """唯一工具注册契约：Schema、兼容解析和预演处理器共同绑定。"""
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal
 from types import MappingProxyType
 from collections.abc import Callable
 import re
@@ -9,6 +9,7 @@ from contextvars import ContextVar
 from pydantic import BaseModel,ValidationError
 from ..json_codec import load_model_json,validate_model_payload,ModelActionRejected,model_validation_feedback
 from ..workspace import WorkspacePayload
+from .cache import CachePool, bind_tool_cache
 from .result import ToolExecution,ToolExecutionResult,ToolContentType,ToolPageReference
 from .progress import ToolProgress,DEFAULT_TOOL_PROGRESS
 from .hooks import ToolHook,ToolHookContext,FeedbackOnlyHook
@@ -37,14 +38,31 @@ class RegisteredTool:
     hooks: tuple[ToolHook, ...] = ()
     # 仅需同事务消费结果的工具启用；结构化结果不进入模型消息。
     persist_result: bool = False
+    retry_guidance: str | None = None
+    # 工具可选声明读写缓存池；留空表示普通一次性工具，运行期零额外开销。
+    read_pools: tuple[CachePool[Any], ...] = ()
+    write_pools: tuple[CachePool[Any], ...] = ()
 
     def __post_init__(self):
         # 注册时复制容器，外部列表追加不会影响本工具，更不会影响其他工具。
         object.__setattr__(self, 'hooks', tuple(self.hooks))
+        object.__setattr__(self, 'read_pools', tuple(self.read_pools))
+        object.__setattr__(self, 'write_pools', tuple(self.write_pools))
+        if self.retry_guidance is not None and (not isinstance(self.retry_guidance, str) or not self.retry_guidance.strip()):
+            raise ValueError('重复失败指导必须为非空文本')
         if type(self.persist_result) is not bool:
             raise TypeError('结构化结果持久化声明必须为布尔值')
         if any(not callable(hook) for hook in self.hooks):
             raise TypeError('工具钩子必须可调用')
+        seen_pools: dict[tuple[str, str], CachePool[Any]] = {}
+        for pool in (*self.read_pools, *self.write_pools):
+            if not isinstance(pool, CachePool):
+                raise TypeError('工具缓存池声明必须使用 CachePool 实例')
+            key = (pool.scope, pool.name)
+            existing = seen_pools.get(key)
+            if existing is not None and existing is not pool:
+                raise ValueError(f'作用域 {pool.scope!r} 中已存在同名的不同 CachePool 实例：{pool.name!r}')
+            seen_pools[key] = pool
 
     def definition(self):
         return {'type':'function','function':{'name':self.name,'description':self.description,
@@ -68,8 +86,11 @@ def check_descriptions(schema):
 
 class ToolRegistry:
     def __init__(self,entries):
+        from .base_tool import BaseTool
         self.entries={}
         for entry in entries:
+            if isinstance(entry, BaseTool):
+                entry = entry.build_registration()
             if not isinstance(entry,RegisteredTool):
                 raise TypeError('工具必须使用 RegisteredTool 注册')
             if not isinstance(entry.name,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',entry.name):
@@ -106,7 +127,23 @@ class ToolRegistry:
             if schema.get('type')!='object':raise ValueError('工具参数顶层必须为对象')
             check_descriptions(schema)
             self.entries[entry.name]=entry
+        # 校验整个工具集合内同作用域下不存在同名的不同 CachePool 实例。
+        seen_pools: dict[tuple[str, str], CachePool[Any]] = {}
+        for entry in self.entries.values():
+            for pool in (*entry.read_pools, *entry.write_pools):
+                key = (pool.scope, pool.name)
+                existing = seen_pools.get(key)
+                if existing is not None and existing is not pool:
+                    raise ValueError(f'作用域 {pool.scope!r} 中已存在同名的不同 CachePool 实例：{pool.name!r}')
+                seen_pools[key] = pool
+        self._pool_scopes = frozenset(scope for scope, _ in seen_pools)
         self.entries=MappingProxyType(self.entries)
+
+    def has_pools(self, scope: str | None = None) -> bool:
+        """判断已注册工具是否声明了指定作用域（或任意作用域）的缓存池。"""
+        if scope is None:
+            return bool(self._pool_scopes)
+        return scope in self._pool_scopes
 
     def require_mode_tools(self):
         """主循环必须具有模式最终输出；独立子工具集合仍可只构造 ToolRegistry。"""
@@ -154,15 +191,18 @@ class ToolRegistry:
         candidate=WorkspacePayload.model_validate(candidate.model_dump())
         return arguments,candidate
 
-    async def execute(self,name,arguments,*,publish_progress=None,call_id=None,hook_context=None):
+    async def execute(self,name,arguments,*,publish_progress=None,call_id=None,hook_context=None,
+                      task_cache=None,session_cache=None):
         token = current_tool_call_id.set(call_id)
         try:
             return await self._execute_with_progress(name, arguments, publish_progress=publish_progress,
-                hook_context=hook_context if hook_context is not None else ToolHookContext())
+                hook_context=hook_context if hook_context is not None else ToolHookContext(),
+                task_cache=task_cache, session_cache=session_cache)
         finally:
             current_tool_call_id.reset(token)
 
-    async def _execute_with_progress(self,name,arguments,*,publish_progress=None,hook_context):
+    async def _execute_with_progress(self,name,arguments,*,publish_progress=None,hook_context,
+                                     task_cache=None,session_cache=None):
         entry=self.entries[name]
         progress=(entry.progress_factory(arguments.model_copy(deep=True))
                   if entry.progress_factory is not None else entry.progress)
@@ -174,19 +214,21 @@ class ToolRegistry:
         if publish_progress is not None:
             await publish_progress(progress)
             try:
-                return await self._execute(name,arguments,hook_context)
+                return await self._execute(name,arguments,hook_context,task_cache=task_cache,session_cache=session_cache)
             finally:
                 await publish_progress(DEFAULT_TOOL_PROGRESS)
-        return await self._execute(name,arguments,hook_context)
+        return await self._execute(name,arguments,hook_context,task_cache=task_cache,session_cache=session_cache)
 
-    async def _execute(self,name,arguments,hook_context):
+    async def _execute(self,name,arguments,hook_context,*,task_cache=None,session_cache=None):
         """只在参数与状态验收后读取资料；结果提交前不能进入模型上下文。"""
         entry=self.entries[name]
         execution=ToolExecution(ToolExecutionResult(status='succeeded',tool_result={'status':'accepted'}))
+        accessor=None
         if entry.executor is not None:
-            result=entry.executor(arguments.model_copy(deep=True))
-            if isawaitable(result):
-                result=await result
+            with bind_tool_cache(entry, task_cache=task_cache, session_cache=session_cache) as accessor:
+                result=entry.executor(arguments.model_copy(deep=True))
+                if isawaitable(result):
+                    result=await result
             # 不再把任意 JSON 包装成 accepted；执行后的契约错误由宿主按结果不确定停止。
             execution=(replace(result) if isinstance(result,ToolExecution)
                        else ToolExecution(ToolExecutionResult.model_validate(result)))
@@ -218,6 +260,20 @@ class ToolRegistry:
                 raise ValueError('工具钩子不能替换或丢弃提交回调')
         if operation_failed and execution.result.content.text is None:
             raise ValueError('业务钩子失败必须由末尾反馈专用钩子渲染')
+        # 仅当最终执行结果为 succeeded 且存在暂存缓存变更时，串接到 after_commit；
+        # 失败、业务钩子抛出 ToolOperationFailed 或 journal.commit 失败时均不提交缓存。
+        if accessor is not None and accessor.has_pending() and execution.result.status == 'succeeded':
+            existing_after_commit = execution.after_commit
+            if existing_after_commit is None:
+                execution = replace(execution, after_commit=accessor.commit)
+            else:
+                def _chained_after_commit():
+                    accessor.commit()
+                    committed = existing_after_commit()
+                    if isawaitable(committed):
+                        return committed
+                    return None
+                execution = replace(execution, after_commit=_chained_after_commit)
         return execution
 
     @staticmethod
@@ -239,10 +295,7 @@ def build_builtin_registrations():
     """可直接复用的基础工具；不含必须由模式实现的最终输出。"""
     from .workspace import build_workspace_registrations
     from .context import build_context_registrations
-    from .date_calculator import build_date_calculation_registration
-    from .current_time import build_current_time_registration
-    return [build_date_calculation_registration(), build_current_time_registration(),
-            *build_workspace_registrations(), *build_context_registrations()]
+    return [*build_workspace_registrations(), *build_context_registrations()]
 
 
 def build_registry(*, finish_task, additional=()):

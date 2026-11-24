@@ -1,17 +1,14 @@
-"""离线可运行示例；替换三个 Provider 后即可接实际服务，存储及运行机制不变。"""
+"""离线可运行示例；替换两个 Provider 后即可接实际服务，存储及运行机制不变。"""
 import argparse
 import asyncio
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
-from textwrap import dedent
 from uuid import uuid4
 from pydantic import BaseModel, Field
-from agent_core import Agent, Models, SQLiteStorage, RegisteredTool, ToolExecutionResult
+from agent_core import AgentRuntime, Models, SQLiteStorage, BaseTool, ToolExecutionResult, schema_sql
 from agent_core.infrastructure.mllm import MLLMCompletion, MLLMToolCall
-from agent_core.providers import ExpertReply
-from agent_core.core.tool.hooks import FeedbackOnlyHook
-from agent_core.core.tool.feedback import with_feedback
 
 
 class DemoChat:
@@ -32,12 +29,6 @@ class DemoEmbedding:
         return [[float(v+1) for v in hashlib.sha256(text.encode()).digest()[:8]] for text in texts]
 
 
-class DemoExpert:
-    async def create_response(self, *, input_items):
-        item={'type':'message','role':'assistant','content':[{'type':'output_text','text':'离线专家示例'}]}
-        return ExpertReply('demo','demo','离线专家示例','completed',0,0,0,{'output':[item]},(item,))
-
-
 async def demo_count(messages, tools, generation):
     # 仅离线替身使用；生产必须换成实际模型 tokenizer。
     return len(json.dumps([messages,tools],ensure_ascii=False))//3
@@ -47,30 +38,43 @@ class ScheduleArgs(BaseModel):
     project: str = Field(description='需要查询交付日期的合成项目名称。')
 
 
-def render(args, execution, context):
-    return with_feedback(execution, dedent("""
-        ### 项目计划
+class ProjectSchedule(BaseTool):
+    name = 'project_schedule'
+    description = '按项目名称查询交付日期。'
+    arguments_model = ScheduleArgs
+    retry_guidance = '请先向用户确认项目名称，再查询交付日期。'
 
-        状态：查询成功
-        交付日期：2026-12-08
-    """).strip())
+    def execute(self, arguments):
+        if arguments.project != '青禾':
+            return self.failure('project_missing', '未找到该项目的交付计划。',
+                                '请核对项目名称，本次未取得日期。')
+        return ToolExecutionResult(status='succeeded', tool_result={'date': '2026-12-08'})
+
+    def render_success(self, arguments, result, context):
+        return f"已查到{arguments.project}项目的交付日期：{result.tool_result['date']}。"
 
 
 async def main(database):
     Path(database).parent.mkdir(parents=True,exist_ok=True)
-    storage=SQLiteStorage(database)
-    tool=RegisteredTool('project_schedule','查询合成项目的交付日期。',ScheduleArgs,
-        lambda n,r,w,a:w,executor=lambda a:ToolExecutionResult(status='succeeded',tool_result={'date':'2026-12-08'}),
-        hooks=(FeedbackOnlyHook(render),))
-    agent=Agent(models=Models(DemoChat(),DemoEmbedding(),DemoExpert(),demo_count),storage=storage,
-        role='你是项目计划助理，根据查询工具返回的事实回答。',tools=[tool])
+    # 示例同时承担首次部署；业务服务启动时直接连接已准备好的库。
+    connection = sqlite3.connect(database)
     try:
-        result=await agent.run('查询青禾项目',owner='demo',tree_id='normal')
-        print(result.answer)
-        async for event in agent.stream('查询青禾项目',owner='demo',tree_id='stream'):
-            print(event.sse(),end='')
+        connection.executescript(schema_sql('sqlite'))
     finally:
-        await agent.close();await storage.close()
+        connection.close()
+    storage = SQLiteStorage.connect(database)
+    runtime = AgentRuntime(models=Models(DemoChat(), DemoEmbedding(), demo_count), database=storage)
+    try:
+        agent = await runtime.create(tree_id=uuid4().hex, role='你是项目计划助理，根据查询工具返回的事实回答。',
+                                     tools=[ProjectSchedule()], persist_new_nodes=True,
+                                     workspace_retention='latest')
+        task = await agent.generate('查询青禾项目')
+        async for event in task.events():
+            print(event.sse(), end='')
+        print((await task.result()).answer)
+    finally:
+        await runtime.close()
+        await storage.close()
 
 
 if __name__=='__main__':

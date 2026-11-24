@@ -4,7 +4,6 @@ import hashlib
 from textwrap import dedent
 from .vectors import normalize_vector
 from .storage import MemoryDocument
-from .core.query_pool import QueryResultPool
 from .core.subgraph.memory_retrieval.schema import MemoryRetrievalResult, RankedTask
 from .core.context_rendering.history import render_turn
 from .core.model import HistoryTurn
@@ -95,10 +94,11 @@ class Memory:
         return tuple(
             RankedTask(node_id=key, score=value) for key,value in sorted(scores.items(), key=lambda item: (-item[1],item[0]))[:20])
 
-    def pool(self, *, parent_id, capacity=10, page_size=3):
+    def reader(self, *, parent_id):
+        """构造绑定当前父链的权威任务回读函数；供 MemoryQueryViewer 按需校验并渲染页面。"""
         from types import SimpleNamespace
-        from .core.subgraph.memory_retrieval.pool import MemoryQueryPool
         from .model.question_file import AttachmentReference
+
         async def read(ids):
             allowed = {task.id for task in await self.repository.path(parent_id)}
             tasks = []
@@ -107,9 +107,14 @@ class Memory:
                     raise ValueError('资料不在当前父链范围')
                 task, _ = await self.repository.load(identifier)
                 fields = public_fields(task)
-                content = SimpleNamespace(question=fields['user_input'], answer=fields['final_output'],
-                    exchanges=task.exchanges, attachments=[AttachmentReference.model_validate(a) for a in task.attachments])
-                messages = [SimpleNamespace(kind=kind, text=text) for kind,text in task.outputs]
+                content = SimpleNamespace(
+                    question=fields['user_input'],
+                    answer=fields['final_output'],
+                    exchanges=task.exchanges,
+                    attachments=[AttachmentReference.model_validate(a) for a in task.attachments],
+                )
+                messages = [SimpleNamespace(kind=kind, text=text) for kind, text in task.outputs]
                 tasks.append(SimpleNamespace(write=SimpleNamespace(node=task, content=content), messages=messages))
             return tasks
-        return MemoryQueryPool(read, capacity=capacity, page_size=page_size)
+
+        return read

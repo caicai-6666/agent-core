@@ -1,7 +1,9 @@
 """任务树、纯内存会话与冻结分身的驻留、排队和交互控制。"""
 import asyncio
+import hashlib
+import json
 from collections import deque
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from math import isfinite
 from time import monotonic
@@ -10,7 +12,7 @@ from .adapters import SQLiteStorage
 from .core import AgentInput
 from .core.model import ContextInjection
 from .model.question_tree import new_tree_id
-from .scheduler import Dispatch
+from .scheduler import Dispatch, Reminders, SchedulerSettings, utc_now
 from .storage import StorageConflict, Write
 from .tasks import TaskRepository
 
@@ -89,6 +91,8 @@ class _ResidentRepository(TaskRepository):
 class SessionTask:
     """一个任务的结果与有界事件窗口；断开观察不会取消队列中的任务。"""
     def __init__(self, task_id):
+        self._activate = self._wake_observer = None
+        self._observers = 0
         self.id = task_id
         self.status = 'queued'
         self._done = asyncio.Event()
@@ -96,6 +100,12 @@ class SessionTask:
         self._events = deque(maxlen=256)
         self._sequence = 0
         self._result = self._error = None
+
+    async def activate(self):
+        """显式激活待执行项；可重复调用，不重放任务。"""
+        if self._activate:
+            await self._activate(self.id)
+        return self
 
     async def emit(self, kind, data):
         from .agent import AgentEvent
@@ -109,27 +119,40 @@ class SessionTask:
         data = {'result': result.model_dump(mode='json')} if result is not None else {}
         await self.emit('task.' + status, data)
         self._done.set()
+        self._activate = self._wake_observer = None
+
+    @contextmanager
+    def _observe(self):
+        self._observers += 1
+        try:
+            if self._wake_observer and not self._done.is_set():
+                self._wake_observer()
+            yield
+        finally:
+            self._observers -= 1
 
     async def result(self):
-        await self._done.wait()
+        with self._observe():
+            await self._done.wait()
         if self._error is not None:
             raise self._error
         return self._result
 
     async def events(self):
-        cursor = 0
-        while True:
-            first = self._sequence - len(self._events)
-            if cursor < first:
-                raise RuntimeError('事件窗口已过期，请回查任务结果')
-            if cursor < self._sequence:
-                event = self._events[cursor - first]
-                cursor += 1
-                yield event
-            elif self._done.is_set():
-                return
-            else:
-                await self._changed.wait()
+        with self._observe():
+            cursor = 0
+            while True:
+                first = self._sequence - len(self._events)
+                if cursor < first:
+                    raise RuntimeError('事件窗口已过期，请回查任务结果')
+                if cursor < self._sequence:
+                    event = self._events[cursor - first]
+                    cursor += 1
+                    yield event
+                elif self._done.is_set():
+                    return
+                else:
+                    await self._changed.wait()
 
 
 @dataclass
@@ -143,8 +166,10 @@ class Session:
         self.runtime, self.owner, self.id = runtime, owner, identifier
         self.kind, self.mode = kind, mode
         self.repository = repository
+        self.role = None
         self.tools = tuple(tools)
         self._scheduler = None
+        self.managed_heartbeat = None
         self._reminder_repository = reminder_repository
         self._lock = asyncio.Lock()
         self._tickets = {}
@@ -157,6 +182,11 @@ class Session:
     def busy(self):
         return bool(self._pins or self._worker or self._active or self._lock.locked())
 
+    @property
+    def evictable(self):
+        # 显式启动的轮询器负责持续存活，只有关闭轮询后才进入普通空闲驱逐。
+        return not self.busy and not (self._scheduler and self._scheduler.running)
+
     def _touch(self):
         if self._expired or self.runtime.closed:
             raise SessionExpired('会话已释放，请重新打开本体或创建新的临时会话')
@@ -165,37 +195,128 @@ class Session:
     async def _queue(self):
         return await self.repository.storage.read(self.repository.scope, 'runtime_queue')
 
-    async def submit(self, question, *, priority=0, source='user', attachments=(), thinking_effort='none',
-                     supplemental='', replace_task_id=None, preview=True):
+    @staticmethod
+    def _enqueue(items, item, merge_with_previous):
+        if merge_with_previous:
+            # 逆序扫描保持原 FIFO 位置，只选择尚在普通队列中的同级任务。
+            for index in reversed(range(len(items))):
+                target = items[index]
+                if (target['priority'] != item['priority'] or target.get('deferred')
+                        or target.get('replace') is not None or target['source'] not in ('user', 'business')):
+                    continue
+                attachments = {ref['file_id']: ref for ref in target['attachments']}
+                for ref in item['attachments']:
+                    if attachments.setdefault(ref['file_id'], ref) != ref:
+                        raise ValueError('同一附件在合并任务中声明了不同类型')
+                merged = {**target,
+                    'question': target['question'] + '\n\n补充要求：\n' + item['question'],
+                    'attachments': list(attachments.values()),
+                    'supplemental': '\n\n'.join(filter(None, (target['supplemental'], item['supplemental']))),
+                    'preview': target.get('preview', True) and item['preview']}
+                return [*items[:index], merged, *items[index + 1:]], target['id']
+        return [*items, item], item['id']
+
+    async def submit(self, question, *, priority=0, merge_with_previous=False, source='user', attachments=(), thinking_effort='none',
+                     supplemental='', replace_task_id=None, preview=True, external_id=None, created_at=None, deferred=False):
         if type(priority) is not int or source not in ('user', 'business') or not isinstance(supplemental, str):
             raise ValueError('需要整数优先级、有效输入来源和文本上下文')
         if type(preview) is not bool:
             raise ValueError('preview 必须为布尔值')
-        request = AgentInput(question=question, attachments=list(attachments), source=source, thinking_effort=thinking_effort)
+        if external_id is not None and (not isinstance(external_id,str) or not external_id.strip()):
+            raise ValueError('外部任务 ID 必须为非空字符串')
+        if type(deferred) is not bool or (deferred and replace_task_id):
+            raise ValueError('待激活任务不能同时替代在途任务')
+        if type(merge_with_previous) is not bool:
+            raise ValueError('merge_with_previous 必须为布尔值')
+        if merge_with_previous and (deferred or replace_task_id is not None):
+            raise ValueError('只有就绪的普通输入可以请求合并')
+        request = AgentInput(question=question, attachments=list(attachments), source=source, thinking_effort=thinking_effort,
+                             **({'created_at':created_at} if created_at is not None else {}))
         ticket = SessionTask(new_tree_id())
         item = {'id': ticket.id, 'question': question, 'priority': priority, 'source': source,
                 'replace': replace_task_id, 'attachments': [a.model_dump(mode='json') for a in request.attachments],
                 'thinking_effort': thinking_effort, 'supplemental': supplemental, 'preview': preview}
+        item['created_at'] = request.created_at.isoformat()
+        item['deferred'] = deferred
+        receipt_key = None
+        if external_id is not None:
+            receipt_key = 'input:' + hashlib.sha256(external_id.encode()).hexdigest()
+            fingerprint = {**item,'created_at':item['created_at'] if created_at is not None else None}
+            fingerprint.pop('id')
+            # 默认请求保持旧版指纹，历史 external_id 可继续重投。
+            if merge_with_previous:
+                fingerprint['merge_with_previous'] = True
+            fingerprint = hashlib.sha256(json.dumps(fingerprint,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
         await self.runtime.evict_idle()
         async with self._lock:
             self._touch()
-            active = self._target(replace_task_id) if replace_task_id is not None else None
             while True:
+                if receipt_key:
+                    receipt = await self.repository.storage.read(self.repository.scope,receipt_key)
+                    if receipt:
+                        if receipt.value['fingerprint'] != fingerprint:
+                            raise StorageConflict('外部任务 ID 已用于不同请求')
+                        identifier = receipt.value['id']
+                        existing = self._tickets.get(identifier)
+                        if existing is None:
+                            existing = SessionTask(identifier)
+                            queued = await self._queue()
+                            if queued and any(i['id'] == identifier and i.get('deferred') for i in queued.value['items']):
+                                existing.status = 'pending_activation'
+                            self._tickets[identifier] = existing
+                        existing._activate, existing._wake_observer = self.activate, self._wake
+                        self._wake()
+                        return existing
+                active = self._target(replace_task_id) if replace_task_id is not None else None
                 record = await self._queue()
                 items = record.value['items'] if record else []
+                pending, identifier = self._enqueue(items, item, merge_with_previous)
                 try:
-                    await self.repository.storage.atomic(self.repository.scope, [
-                        Write('runtime_queue', record.version if record else None, {'items': [*items, item]})])
+                    writes = [Write('runtime_queue', record.version if record else None, {'items': pending})]
+                    if receipt_key:
+                        writes.append(Write(receipt_key,None,{'id':identifier,'fingerprint':fingerprint}))
+                    await self.repository.storage.atomic(self.repository.scope,writes)
                     break
                 except StorageConflict:
                     continue
+            if identifier != ticket.id:
+                ticket = self._tickets.get(identifier) or SessionTask(identifier)
             self._tickets[ticket.id] = ticket
-            self._wake()
+            ticket._activate, ticket._wake_observer = self.activate, self._wake
+            if deferred:
+                ticket.status = 'pending_activation'
+            else:
+                self._wake()
             if active:
                 # 若原任务在入队期间已进入终态，消费者会拒绝替代请求，不会改停下一任务。
                 if not active.control.finishing and not active.task._done.is_set():
                     active.control.interrupt('superseded')
         return ticket
+
+    async def activate(self, task_id):
+        async with self._lock:
+            self._touch()
+            while True:
+                queue = await self._queue()
+                items = queue.value['items'] if queue else []
+                entry = next((item for item in items if item['id']==task_id),None)
+                if entry is None:
+                    # 可能已被另一个执行者领取；先验证标识确实属于这棵树。
+                    await self.repository.load(task_id)
+                    break
+                if not entry.get('deferred'):
+                    break
+                entry['deferred'] = False
+                try:
+                    await self.repository.storage.atomic(self.repository.scope,[Write('runtime_queue',queue.version,{'items':items})])
+                    break
+                except StorageConflict:
+                    continue
+            ticket = self._tickets.setdefault(task_id,SessionTask(task_id))
+            if ticket.status == 'pending_activation':
+                ticket.status = 'queued'
+            self._wake()
+            return ticket
 
     @property
     def active_task_id(self):
@@ -206,14 +327,14 @@ class Session:
             if self._active or self._expired:
                 return
             queue = await self._queue()
-            if queue and queue.value['items']:
+            if queue and any(not i.get('deferred') for i in queue.value['items']):
                 return
             ticket = SessionTask(identifier)
             active = self._active = _Active(ticket, _Control())
         try:
             result = await self.runtime.agent.run(message, owner=self.owner, tree_id=self.id,
                 task_id=identifier, publish=publish, _dispatch=dispatch, _control=active.control,
-                _repository=self.repository, _reminder_repository=self._reminder_repository, _session_tools=self.tools)
+                _repository=self.repository, _reminder_repository=self._reminder_repository, _session_tools=self.tools, _role=self.role)
             await ticket.finish('completed', result=result)
             return result
         except asyncio.CancelledError:
@@ -232,7 +353,12 @@ class Session:
     def scheduler(self, *, settings=None, publish=None):
         from .scheduler import AgentScheduler, SchedulerSettings
         self._touch()
-        if self.kind != 'memory':
+        if self.role is not None and self.kind == 'fork':
+            parent = self.runtime.resident(self.owner,self._reminder_repository.tree_id)
+            if parent is None:
+                raise SessionExpired('提醒已归属本体；请恢复本体后启动调度')
+            return parent.scheduler(settings=settings,publish=publish)
+        if self.kind != 'memory' and self.role is None:
             return self.runtime.agent.scheduler(owner=self.owner, tree_id=self._reminder_repository.tree_id,
                                                 settings=settings, publish=publish)
         config = settings or SchedulerSettings()
@@ -294,6 +420,27 @@ class Session:
                 await ticket.finish(task.status, error=error)
             self._tickets.pop(identifier)
 
+    async def _select_next(self, ready, queue):
+        # 定向替代紧随旧任务，普通业务按优先级及到达顺序领取。
+        item = max(ready,key=lambda x:(x['replace'] is not None,x['priority']))
+        rest = [entry for entry in queue.value['items'] if entry['id'] != item['id']]
+        consume = Write('runtime_queue',queue.version,{'items':rest})
+        if item['replace'] or self.kind=='fork' or not self.runtime.agent.reminder_tools:
+            return item, (consume,)
+
+        repo = self.repository
+        await Reminders(repo).materialize_due(utc_now())
+        due = await repo.storage.read(repo.scope,'reminder_queue')
+        if not due or not due.value['items']:
+            # 领取时若另一执行者已经物化到期提醒，CAS 失败后重新比较来源优先级。
+            guard = Write('reminder_queue',due.version if due else None,{'items':[]})
+            return item, (consume,guard)
+        first, *remaining = due.value['items']
+        reminder = dict(id=first['id'],source='reminder',question=first['message'],replace=None,
+                        attachments=[],thinking_effort='none',supplemental='',created_at=first.get('scheduled_for'))
+        return reminder, (Write('runtime_queue',queue.version,queue.value),
+                          Write('reminder_queue',due.version,{'items':remaining}))
+
     async def _drain(self):
         repo = self.repository
         try:
@@ -301,44 +448,57 @@ class Session:
                 async with self._lock:
                     record = await self._queue()
                     items = record.value['items'] if record else []
-                    await self._observe_other_workers({item['id'] for item in items})
+                    queued_ids = {item['id'] for item in items}
+                    await self._observe_other_workers(queued_ids)
                     if not items and not self._tickets:
+                        self._worker = None
+                        return
+                    items = [item for item in items if not item.get('deferred')]
+                    if (not items and self._tickets.keys() <= queued_ids
+                            and not any(t._observers for t in self._tickets.values())):
                         self._worker = None
                         return
                     # max 保留首个同分项；定向替代在旧任务确认结束后优先接续。
                     tree = await repo.storage.read(repo.scope, 'tree')
                     waiting = self._active is not None or not items or (tree and tree.value['active'] is not None)
                     if not waiting:
-                        item = max(items, key=lambda x: (x['replace'] is not None, x['priority']))
-                        write = Write('runtime_queue', record.version, {'items': [x for x in items if x['id'] != item['id']]})
+                        try:
+                            item, writes = await self._select_next(items, record)
+                        except StorageConflict:
+                            continue
                         ticket = self._tickets.setdefault(item['id'], SessionTask(item['id']))
                         if item['replace']:
                             old, _ = await repo.load(item['replace'])
                             if old.status != 'superseded' or tree.value['head'] != old.id:
                                 try:
-                                    await repo.storage.atomic(repo.scope, [write,
+                                    await repo.storage.atomic(repo.scope, [*writes,
                                         Write('runtime_rejected:' + ticket.id, None, {'target': old.id})])
                                 except StorageConflict:
                                     continue
                                 await ticket.finish('failed', error=StorageConflict('原任务未被替代，未执行新指令'))
                                 self._tickets.pop(ticket.id)
                                 continue
-                        dispatch = Dispatch(item['source'], tree.version if tree else None, (write,))
+                        dispatch = Dispatch(item['source'], tree.version if tree else None, writes)
                         self._active = _Active(ticket, _Control())
                         ticket.status = 'running'
                 if waiting:
                     await asyncio.sleep(.05)
                     continue
                 try:
+                    scheduled = item['source']=='reminder'
+                    scheduler = self._scheduler or self.runtime.agent._schedulers.get((self.owner,self.id))
                     result = await self.runtime.agent.run(item['question'], owner=self.owner, tree_id=self.id,
                         task_id=ticket.id, attachments=item['attachments'], thinking_effort=item['thinking_effort'],
-                        supplemental=item['supplemental'], _events=ticket.emit, _preview=item.get('preview', True),
+                        supplemental=item['supplemental'], _events=None if scheduled else ticket.emit,
+                        publish=scheduler.publish if scheduled and scheduler else None, _preview=item.get('preview', True),
                         _repository=repo, _reminder_repository=self._reminder_repository, _session_tools=self.tools,
-                        _control=self._active.control, _dispatch=dispatch)
+                        _control=self._active.control, _dispatch=dispatch, _role=self.role, created_at=item.get('created_at'))
                 except StorageConflict as error:
                     # 入队/领取竞争只在请求仍留队时重选；已开始的工具绝不重放。
                     if not self._active.control.started:
-                        # 已被其他执行器领取时，下轮通过任务记录观察其终态。
+                        # 提醒仍在自己的队列中，内部占位句柄不作为普通任务继续观察。
+                        if scheduled:
+                            self._tickets.pop(ticket.id,None)
                         continue
                     await ticket.finish('failed', error=error)
                 except asyncio.CancelledError:
@@ -398,16 +558,24 @@ class SessionRuntime:
         if session.busy:
             raise StorageConflict('会话有等待、执行或恢复操作')
         session._expired = True
+        for ticket in session._tickets.values():
+            await ticket.finish('expired',error=SessionExpired('本地任务句柄已释放；持久树可使用任务 ID 重新激活'))
+        session._tickets.clear()
+        # 调用者可以长期持有公开句柄，驱逐时必须主动释放深复制的历史与工作区。
+        session.repository.baseline = ContextInjection()
+        session.repository.snapshot = session.repository.baseline
+        session.repository.tip = None
         self._residents.pop((session.owner, session.id))
         if session._scheduler:
             await session._scheduler.close()
+        # 无论持久树、内存会话还是冻结分身，释放或空闲驱逐时均同步释放对应的会话缓存作用域。
+        self.agent.cache_scopes.release(session.owner, session.id)
         if session.kind != 'persistent':
-            self.agent.experts.release(session.owner, session.id)
             await session.repository.storage.close()
 
     async def _sweep(self):
         for session in list(self._residents.values()):
-            if not session.busy and monotonic() - session.touched >= self.ttl:
+            if session.evictable and monotonic() - session.touched >= self.ttl:
                 await self._release(session)
 
     async def _maintain(self):
@@ -436,17 +604,26 @@ class SessionRuntime:
                 raise SessionExpired('会话已释放')
             await self._release(session)
 
-    async def _open(self, owner, identifier, kind, mode, baseline, reminders=None, tools=()):
+    async def _open(self, owner, identifier, kind, mode, baseline, reminders=None, tools=(), *, role=None,
+                    retention=None, create=False, heartbeat=None):
         if mode not in ('queue', 'interruptible') or not owner.strip() or not identifier.strip():
             raise ValueError('需要有效用户、会话标识和执行模式')
+        if heartbeat is not None:
+            heartbeat = SchedulerSettings.model_validate(heartbeat)
+            if mode != 'queue' or heartbeat.heartbeat_interval_seconds < 1:
+                raise ValueError('实例心跳需要队列执行模式和正数间隔')
         async with self._lock:
             if self.closed or self.agent._closed:
                 raise RuntimeError('运行时已关闭')
             await self._sweep()
             existing = self._residents.get((owner, identifier))
             if existing is not None:
-                if existing.kind != kind or existing.mode != mode or existing.tools != tuple(tools):
+                if create:
+                    raise StorageConflict('该树已存在')
+                if existing.kind != kind or existing.mode != mode or existing.tools != tuple(tools) or existing.role != role:
                     raise StorageConflict('同一会话已绑定其他形态或执行模式')
+                if heartbeat is not None and heartbeat != existing.managed_heartbeat:
+                    raise StorageConflict('该树已绑定其他心跳策略')
                 existing._touch()
                 if kind == 'persistent' and not existing.busy:
                     queue = await existing._queue()
@@ -454,7 +631,7 @@ class SessionRuntime:
                         existing._wake()
                 return existing
             if len(self._residents) >= self.capacity:
-                idle = [session for session in self._residents.values() if not session.busy]
+                idle = [session for session in self._residents.values() if session.evictable]
                 if not idle:
                     raise StorageConflict('所有驻留会话均在使用中')
                 await self._release(min(idle, key=lambda session: session.touched))
@@ -462,23 +639,46 @@ class SessionRuntime:
             if store is None:
                 raise ValueError('持久会话需要存储适配器')
             repo = _ResidentRepository(store, owner=owner, tree_id=identifier, baseline=baseline.model_copy(deep=True),
-                                       workspace_retention=self.agent.workspace_retention if kind == 'persistent' else 'per_node')
+                                       workspace_retention=(retention or self.agent.workspace_retention) if kind == 'persistent' else 'per_node')
             session = Session(self, owner, identifier, kind, mode, repo, reminders or repo, tools)
+            session.role = role
             if kind == 'persistent':
-                await repo.bind()
+                policy_value = {'mode': mode}
+                if heartbeat is not None:
+                    policy_value['heartbeat'] = heartbeat.model_dump()
+                if create:
+                    # 树和运行约定同事务创建；并发创建者中只有一个可以成功。
+                    await store.atomic(repo.scope,[Write('tree',None,repo._tree_state(None)),
+                                       Write('runtime_session',None,policy_value)])
+                else:
+                    await repo.bind()
                 # 会话执行约定跨进程与重启保持一致，禁止队列绑定方绕过不可打断策略。
                 policy = await store.read(repo.scope, 'runtime_session')
                 if policy is None:
                     try:
-                        await store.atomic(repo.scope, [Write('runtime_session', None, {'mode': mode})])
+                        await store.atomic(repo.scope, [Write('runtime_session', None, policy_value)])
                     except StorageConflict:
                         policy = await store.read(repo.scope, 'runtime_session')
                 if policy is not None and policy.value['mode'] != mode:
                     raise StorageConflict('此任务树已登记其他执行模式')
+                if policy is not None and role is not None:
+                    saved = policy.value.get('heartbeat')
+                    if saved is not None:
+                        registered = SchedulerSettings.model_validate(saved)
+                        if heartbeat is not None and heartbeat != registered:
+                            raise StorageConflict('该树已绑定其他心跳策略')
+                        heartbeat = registered
+                    elif heartbeat is not None:
+                        await store.atomic(repo.scope, [Write('runtime_session', policy.version,
+                            {**policy.value, 'heartbeat': heartbeat.model_dump()})])
                 # 重启重新绑定后继续未领取的任务；已占树的任务须走显式故障恢复。
                 queue = await session._queue()
                 if queue and queue.value['items']:
                     session._wake()
+            if heartbeat is not None:
+                # 轮询器跟随实例驻留，重复恢复复用同一消费者。
+                session.managed_heartbeat = heartbeat
+                session.scheduler(settings=heartbeat).start()
             self._residents[(owner, identifier)] = session
             if self._maintenance is None:
                 self._maintenance = asyncio.create_task(self._maintain())

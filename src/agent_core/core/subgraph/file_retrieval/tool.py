@@ -1,63 +1,87 @@
 """内部检索工具只有引用和计数反馈；没有列表查看入口。"""
 from dataclasses import replace
-from ...model import AgentDependencyError
 from textwrap import dedent
 from pydantic import ValidationError
 from ...json_codec import load_model_json, validate_model_payload, ModelActionRejected, model_validation_feedback
+from ...model import AgentDependencyError
+from ...tool.hooks import FeedbackOnlyHook
 from ...tool.registry import RegisteredTool, ToolRegistry
 from ...tool.result import OrdinaryToolContent, ToolExecutionResult
-from .schema import NameQuery, SummaryQuery, PassportQuery, UnionResults, FinishRetrieval
+from .schema import NameQuery, SummaryQuery, TagQuery, UnionResults, FinishRetrieval
 
-MODELS = {'search_files_by_name':NameQuery,'search_files_by_summary':SummaryQuery,
-          'search_files_by_passport':PassportQuery,
-          'union_file_results':UnionResults,'finish_file_retrieval':FinishRetrieval}
+MODELS = {
+    'search_files_by_name': NameQuery,
+    'search_files_by_summary': SummaryQuery,
+    'search_files_by_tag': TagQuery,
+    'union_file_results': UnionResults,
+    'finish_file_retrieval': FinishRetrieval,
+}
 
 
 def definitions():
-    return [{'type':'function','function':{'name':name,'description':model.__doc__,
-        'parameters':model.model_json_schema(),'strict':False}} for name,model in MODELS.items()]
+    return [
+        {
+            'type': 'function',
+            'function': {
+                'name': name,
+                'description': model.__doc__,
+                'parameters': model.model_json_schema(),
+                'strict': False,
+            },
+        }
+        for name, model in MODELS.items()
+    ]
 
 
 async def execute(pool, search, name, raw):
     try:
-        model=MODELS.get(name)
+        model = MODELS.get(name)
         if model is None:
             raise ModelActionRejected('请求的工具不在当前文件检索工具列表中，未执行查询。', '请选择本轮实际提供的工具。')
-        args=validate_model_payload(model,load_model_json(raw) if isinstance(raw,str) else raw)
-        if name=='finish_file_retrieval':
-            ranking=pool.get(args.result_id) if args.result_id is not None else None
-            return {'status':'success','finished':True,'count':len(ranking.hits) if ranking else 0},ranking,args.explanation
-        if name=='union_file_results':
-            rid=pool.union(args.left_result_id,args.right_result_id)
+        args = validate_model_payload(model, load_model_json(raw) if isinstance(raw, str) else raw)
+        if name == 'finish_file_retrieval':
+            ranking = pool.get(args.result_id) if args.result_id is not None else None
+            return {'status': 'success', 'finished': True, 'count': len(ranking.hits) if ranking else 0}, ranking, args.explanation
+        if name == 'union_file_results':
+            rid = pool.union(args.left_result_id, args.right_result_id)
         else:
-            scope=pool.scope(args.result_id)
-            field = {'search_files_by_name':'name', 'search_files_by_summary':'abstract',
-                     'search_files_by_passport':'passport'}[name]
+            scope = pool.scope(args.result_id)
+            field = {
+                'search_files_by_name': 'name',
+                'search_files_by_summary': 'summary',
+                'search_files_by_tag': 'tag',
+            }[name]
             try:
-                hits=await search(field,args.passport if field=='passport' else args.query,scope)
+                hits = await search(field, args.tag if field == 'tag' else args.query, scope)
             except ModelActionRejected:
                 raise
             except (PermissionError, AgentDependencyError):
                 raise
             except Exception:
-                return {'status':'error','fatal':True,
-                    'message':'文件查询未能完成，本次未取得可用结果，不能解释为没有相关文件。',
-                    'required_action':'请稍后重新检索；不能根据本次失败判断文件是否存在。'},None,None
+                return {
+                    'status': 'error',
+                    'fatal': True,
+                    'message': '文件查询未能完成，本次未取得可用结果，不能解释为没有相关文件。',
+                    'required_action': '请稍后重新检索；不能根据本次失败判断文件是否存在。',
+                }, None, None
             if not hits:
                 # 查询期间父引用可能已释放；空结果也必须核对引用有效性。
                 pool.scope(args.result_id)
-                return {'status':'success','count':0},None,None
-            rid=pool.put(hits,field if field!='abstract' else 'summary',args.result_id,exact=field=='passport')
-        return {'status':'success','result_id':rid,'count':len(pool.get(rid).hits)},None,None
+                return {'status': 'success', 'count': 0}, None, None
+            rid = pool.put(hits, field, args.result_id, exact=field == 'tag')
+        return {'status': 'success', 'result_id': rid, 'count': len(pool.get(rid).hits)}, None, None
     except ValidationError as error:
         feedback = model_validation_feedback(error, model)
-        return {'status':'error','message':feedback.reason,'required_action':feedback.required_action},None,None
+        return {'status': 'error', 'message': feedback.reason, 'required_action': feedback.required_action}, None, None
     except ModelActionRejected as error:
-        return {'status':'error','message':error.reason,'required_action':error.required_action},None,None
-    except (ValueError,TypeError):
-        return {'status':'error','fatal':True,
-            'message':'文件候选结果未通过处理校验，本次未完成检索。',
-            'required_action':'请重新检索；不要把未通过校验的候选当作有效结果。'},None,None
+        return {'status': 'error', 'message': error.reason, 'required_action': error.required_action}, None, None
+    except (ValueError, TypeError):
+        return {
+            'status': 'error',
+            'fatal': True,
+            'message': '文件候选结果未通过处理校验，本次未完成检索。',
+            'required_action': '请重新检索；不要把未通过校验的候选当作有效结果。',
+        }, None, None
 
 
 def render_file_retrieval_feedback(arguments, execution, context):
@@ -114,7 +138,7 @@ class FileRetrievalToolSession:
                 model,
                 lambda name, raw, workspace, arguments: workspace,
                 executor=self.executor_for(name),
-                hooks=(render_file_retrieval_feedback,),
+                hooks=(FeedbackOnlyHook(render_file_retrieval_feedback),),
             )
             for name, model in MODELS.items()
         ])

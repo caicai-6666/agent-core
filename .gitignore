@@ -51,3 +51,6 @@ dist/
 *.tmp
 *.swp
 *~
+
+# 随包分发的正式数据库建表脚本。
+!/src/agent_core/adapters/schema/*.sql

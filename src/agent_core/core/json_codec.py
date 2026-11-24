@@ -11,8 +11,9 @@ Model = TypeVar('Model', bound=BaseModel)
 class ModelActionRejected(ValueError):
     """仅传递校验位置提供的安全反馈；此类不维护业务提示文案。"""
 
-    def __init__(self, reason: str, required_action: str):
+    def __init__(self, reason: str, required_action: str, *, reason_code: str | None = None):
         super().__init__(reason)
+        self.reason_code = reason_code
         self.reason = reason
         self.required_action = required_action
 

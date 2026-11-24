@@ -10,6 +10,7 @@ from .prompt import build_memory_retrieval_prompt
 from ...json_codec import render_json, ModelActionRejected
 from ...workspace import empty_workspace
 from ...context_budget import validate_count
+from ...tool.retry import ToolFailureTracker
 from ...tool.registry import check_descriptions
 
 
@@ -30,6 +31,7 @@ async def run_memory_retrieval(request, *, search, generate, counter, generation
     for tool in tools:
         check_descriptions(tool['function']['parameters'])
     history, recovery = [], []
+    failures = ToolFailureTracker(max_errors)
     for _ in range(max_rounds):
         messages = deepcopy(prefix+history+recovery)
         if validate_count(await counter(messages, tools, generation))+generation.max_completion_tokens > context_window:
@@ -41,6 +43,7 @@ async def run_memory_retrieval(request, *, search, generate, counter, generation
             return failure('model_unavailable','记忆检索请求未成功，未取得检索结果；可稍后重试，不能据此判断没有历史记忆。')
         valid = (response.finish_reason in ('stop','tool_calls') and not response.assistant_message.get('refusal')
             and len(response.tool_calls) == 1)
+        name = response.tool_calls[0].name if valid and response.tool_calls[0].name in registry.entries else None
         try:
             if not valid:
                 raise ModelActionRejected(
@@ -57,7 +60,7 @@ async def run_memory_retrieval(request, *, search, generate, counter, generation
                 原因：{reason}
                 下一步：{action}
             """).strip().format(reason=error.reason, action=error.required_action)
-            recovery.append({'role': 'user', 'content': text})
+            recovery.append({'role': 'user', 'content': failures.feedback(text, name, error.reason_code or error.reason)})
             if len(recovery) >= max_errors:
                 return failure('correction_limit', '记忆检索连续纠错达到上限，本次查询未完成。请缩短需求并明确检索对象后重试。')
             continue
@@ -66,10 +69,12 @@ async def run_memory_retrieval(request, *, search, generate, counter, generation
         if feedback['status'] == 'error':
             if feedback.get('error_code') in ('query_execution_failed','query_busy'):
                 return failure(feedback['error_code'], feedback['error'])
-            recovery.append({'role': 'user', 'content': execution.result.content.text})
+            text = failures.feedback(execution.result.content.text, name, feedback.get('message') or feedback.get('error_code') or execution.result.content.text)
+            recovery.append({'role': 'user', 'content': text})
             if len(recovery) >= max_errors:
                 return failure('correction_limit','记忆检索连续纠错达到上限，本次查询未完成。请缩短需求并明确检索对象后重试。')
             continue
+        failures.success(name)
         recovery.clear()
         if call.name == 'execute_query':
             return session.result

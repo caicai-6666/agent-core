@@ -19,8 +19,10 @@ from .subgraph.context_management.workspace_compression.errors import WorkspaceE
 from .json_codec import render_json,ModelActionRejected
 from .journal import MemoryJournal
 from .model import AgentInput, AgentResult, CoreSettings
+from .tool.retry import ToolFailureTracker
 from .prompt import build_system_prompt,build_system_guidence_message
 from .tool import ToolRegistry,ToolHookContext
+from .tool.cache import CacheScope
 from .context_rendering.page import render_tool_receipt
 from .page_display import PageDisplayWindow
 from .guidance import RequestGuidance
@@ -157,7 +159,7 @@ class AgentCore:
             max_errors=self.options.max_consecutive_errors,token_budget=token_budget,
             protected=protected,reserved_path=reserved_path,tool_call_template=self.tool_call_template)
 
-    async def run(self,request: AgentInput,*,journal=None,publish=None,publish_progress=None,output_observer: OutputObserver | None = None) -> AgentResult:
+    async def run(self,request: AgentInput,*,journal=None,publish=None,publish_progress=None,output_observer: OutputObserver | None = None,_session_cache: CacheScope | None = None) -> AgentResult:
         if output_observer is not None and any(t.deliver_output is not None for t in self.registry.entries.values()):
             raise ValueError('条件交付工具不支持流式预览，须在完整参数验收后决定发送')
         from .tool.hooks import FeedbackOnlyHook
@@ -175,7 +177,7 @@ class AgentCore:
         client=self.client or MLLMClient(self.settings)
         try:
             # 多轮探索/助理任务不设累计时限；单次依赖请求与取消清理仍各自有界。
-            return await self._run(request,journal,client,publish,publish_progress,output_observer)
+            return await self._run(request,journal,client,publish,publish_progress,output_observer,_session_cache=_session_cache)
         except BaseException as error:
             try:
                 async with asyncio.timeout(self.options.cleanup_timeout_seconds):
@@ -192,21 +194,35 @@ class AgentCore:
             if owned:
                 await client.close()
 
-    async def _run(self,request,journal,client,publish,publish_progress,output_observer):
+    async def _run(self,request,journal,client,publish,publish_progress,output_observer,*,_session_cache=None):
         self.registry.require_mode_tools()
         self.registry.require_supported_content(('ordinary','foldable'))
         pages=PageDisplayWindow(self.registry.resolve_page,max_rounds=self.options.page_display_rounds)
-        try:return await self._run_loop(request,journal,client,publish,pages,publish_progress,output_observer)
+        # task 作用域缓存池按单次任务创建并在结束时释放；独立调用 AgentCore 时按需兜底 session 作用域。
+        task_cache=CacheScope('task') if self.registry.has_pools('task') else None
+        owns_session_cache=_session_cache is None and self.registry.has_pools('session')
+        session_cache=CacheScope('session') if owns_session_cache else _session_cache
+        try:
+            return await self._run_loop(request,journal,client,publish,pages,publish_progress,output_observer,
+                                        task_cache=task_cache,session_cache=session_cache)
         finally:
-            pages.close()
-            if output_observer is not None:
+            try:
+                if task_cache is not None:
+                    task_cache.close()
+            finally:
                 try:
-                    async with asyncio.timeout(self.options.cleanup_timeout_seconds):
-                        await output_observer.interrupt()
-                except Exception as error:
-                    journal.audit.append({'event':'preview_cleanup_failed','error_type':type(error).__name__})
+                    if owns_session_cache and session_cache is not None:
+                        session_cache.close()
+                finally:
+                    pages.close()
+                    if output_observer is not None:
+                        try:
+                            async with asyncio.timeout(self.options.cleanup_timeout_seconds):
+                                await output_observer.interrupt()
+                        except Exception as error:
+                            journal.audit.append({'event':'preview_cleanup_failed','error_type':type(error).__name__})
 
-    async def _run_loop(self,request,journal,client,publish,pages,publish_progress,output_observer):
+    async def _run_loop(self,request,journal,client,publish,pages,publish_progress,output_observer,*,task_cache=None,session_cache=None):
         # 模式状态每次运行独立创建；Core 默认不附加沟通策略。
         request_guidance=self.guidance_factory(self.options) if self.guidance_factory is not None else None
         generation=self.generation(request.thinking_effort)
@@ -219,6 +235,17 @@ class AgentCore:
         temporary=[]
         context=request.context.model_copy(deep=True)
         errors=0
+        failures = ToolFailureTracker(self.options.max_consecutive_errors)
+
+        def repeated_failure(name, cause):
+            entry = self.registry.entries.get(name)
+            if entry is None:
+                return None
+            advice = failures.failure(name, cause, entry.retry_guidance)
+            if advice:
+                return build_system_guidence_message(kind='output_error',
+                    reason=f'工具 {name} 的当前调用方式需要调整。', required_action=advice)
+
         compressions=0
         seen=set()
         intermediate=[]
@@ -318,6 +345,10 @@ class AgentCore:
                 temporary.append(build_system_guidence_message(kind='output_error',reason=reason+' 本次动作未提交。',
                     required_action=action+
                         ('\n'+tool_tag_section(self.tool_call_template) if self.tool_call_template else '')))
+                if len(response.tool_calls) == 1:
+                    hint = repeated_failure(response.tool_calls[0].name, getattr(error, 'reason_code', None) or reason)
+                    if hint:
+                        temporary.append(hint)
                 journal.audit.append({'event':'rejected','error_type':type(error).__name__,'fields':location})
                 if errors>=self.options.max_consecutive_errors:
                     raise AgentCoreError('连续工具校验失败达到上限')
@@ -380,6 +411,9 @@ class AgentCore:
                 temporary.append(build_system_guidence_message(kind='output_error',
                     reason=error.reason or '工作区整理未能完成，本次修改未提交，旧工作区保持不变。',
                     required_action=error.required_action or '缩小本次修改或先精简已有重复内容；不要假定失败修改已生效。'))
+                hint = repeated_failure(call.name, error.reason)
+                if hint:
+                    temporary.append(hint)
                 journal.audit.append({'event':'rejected','tool':call.name,'code':'workspace_edit_rejected'})
                 if errors>=self.options.max_consecutive_errors:
                     raise AgentCoreError('连续工具校验失败达到上限')
@@ -399,6 +433,8 @@ class AgentCore:
                         workspace_feedback=workspace_feedback,
                         compacted_turns=summary_size if summary_result is not None else None,
                     ),
+                    task_cache=task_cache,
+                    session_cache=session_cache,
                 )
                 result=execution.result
                 if execution.output is not None:
@@ -433,6 +469,8 @@ class AgentCore:
                 if control:
                     control.finishing = False
                 if output_observer is not None:await output_observer.interrupt()
+                cause = result.tool_result.get('code') or result.tool_result.get('reason')
+                hint = repeated_failure(call.name, cause if isinstance(cause, str) else receipt['content'])
                 if result.failure_mode == 'failed':
                     # 执行失败是已确认的事实，保留回执供模型诚实说明；不接受候选工作区或成功回调。
                     proposed = [*all_exchanges, *pair, *guidance]
@@ -441,11 +479,15 @@ class AgentCore:
                     all_exchanges = proposed
                     accepted.extend([*pair, *guidance])
                     temporary.clear()
+                    if hint:
+                        temporary.append(hint)
                     errors = 0
                     continue
                 errors+=1
                 # 具体原因和修复动作由工具错误分支提供，不能再用“检查参数”覆盖。
                 temporary.extend([*pair,*[dict(item.message) for item in result.system_guidence]])
+                if hint:
+                    temporary.append(hint)
                 journal.audit.append({'event':'rejected','tool':call.name,'code':result.tool_result.get('code')})
                 if errors>=self.options.max_consecutive_errors:raise AgentCoreError('连续工具校验失败达到上限')
                 continue
@@ -474,6 +516,7 @@ class AgentCore:
                 from inspect import isawaitable
                 committed=execution.after_commit()
                 if isawaitable(committed):await committed
+            failures.success(call.name)
             pages.register(call.call_id,result,tool_name=call.name)
             journal.audit.append({'event':'accepted','tool':call.name})
             all_exchanges=proposed

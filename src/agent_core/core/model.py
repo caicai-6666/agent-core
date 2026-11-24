@@ -68,18 +68,8 @@ class CoreSettings(CoreModel):
     management_reserve_tokens: int = Field(default=1024,strict=True,ge=1)
     file_cache_max_files: int = Field(default=4,strict=True,ge=1)
     page_display_rounds: int = Field(default=5,strict=True,ge=1)
-    expert_session_cache_max_sessions: int = Field(default=10,strict=True,ge=1)
     memory_cache_max_queries: int = Field(default=10,strict=True,ge=1)
     memory_page_size: int = Field(default=3,strict=True,ge=1)
-    web_search_cache_max_queries: int = Field(default=10,strict=True,ge=1)
-    web_search_page_size: int = Field(default=5,strict=True,ge=1)
-    web_search_max_concurrent_requests: int = Field(default=2,strict=True,ge=1)
-    web_page_cache_max_entries: int = Field(default=10,strict=True,ge=1)
-    web_page_chars: int = Field(default=3000,strict=True,ge=1)
-    # 数量预算由部署配置决定，不再叠加固定的 20/6 张上限。
-    web_image_max_candidates: int = Field(default=6,strict=True,ge=1)
-    web_image_max_selected: int = Field(default=3,strict=True,ge=1)
-    web_image_max_bytes: int = Field(default=4*1024*1024,strict=True,ge=1)
 
 
 class AgentResult(CoreModel):

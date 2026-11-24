@@ -8,12 +8,14 @@ from pydantic import BaseModel, ConfigDict
 from .core import AgentCore, AgentInput, AgentResult, CoreSettings, AgentCoreError
 from .core.model import ContextInjection
 from .core.prompt import build_system_prompt
+from .core.subgraph.memory_retrieval import create_memory_cache_pool
 from .core.tool import ToolRegistry, FinishTaskTool, build_builtin_registrations
-from .core.tool.external_expert import build_external_expert_registrations
+from .core.tool.file_notes import FILE_NOTE_TOOL_NAMES, FileNoteTools
 from .core.tool.memory_search import build_memory_search_registration
 from .core.tool.memory_viewer import MemoryQueryViewer, build_memory_view_registration
 from .core.tool.hooks import FeedbackOnlyHook
-from .core.expert import ExpertSessions
+from .core.tool.cache import SessionCacheScopes
+from .file_notes import FileNoteStore, create_file_note_cache_pool
 from .tasks import TaskRepository, PersistentJournal
 from .memory import Memory
 from .providers import Models, RuntimeSettings
@@ -49,12 +51,17 @@ class AgentEvent(BaseModel):
 class Agent:
     def __init__(self, *, models: Models, storage=None, role: str, settings=None, options=None,
                  tools=(), tool_factory=None, builtin_names=None, finish_task=None,
-                 memory_tools=True, expert_tools=True, reminder_tools=False,
+                 memory_tools=True, reminder_tools=False,
+                 file_note_tools: bool = False, file_note_authorize=None,
                  session_capacity=100, session_ttl_seconds=1800, workspace_retention="per_node"):
         if not isinstance(role, str) or not role.strip():
             raise ValueError('必须提供业务角色提示词')
         if workspace_retention not in ('per_node', 'latest'):
             raise ValueError('workspace_retention 必须为 per_node 或 latest')
+        if type(file_note_tools) is not bool:
+            raise ValueError('file_note_tools 必须为布尔值')
+        if file_note_authorize is not None and not callable(file_note_authorize):
+            raise TypeError('file_note_authorize 必须可调用或为 None')
         self.workspace_retention = workspace_retention
         self.models, self.storage, self.role = models, storage, role
         self.settings = settings or RuntimeSettings()
@@ -62,10 +69,11 @@ class Agent:
         self.tools, self.tool_factory = tuple(tools), tool_factory
         self.builtin_names = set(builtin_names) if builtin_names is not None else None
         self.finish_task = finish_task or FinishTask()
-        self.memory_tools, self.expert_tools = memory_tools, expert_tools
-        self.experts = ExpertSessions(client=models.expert,
-            capacity=self.options.expert_session_cache_max_sessions)
+        self.memory_tools = memory_tools
+        self.cache_scopes = SessionCacheScopes(max_scopes=session_capacity)
         self.reminder_tools = reminder_tools
+        self.file_note_tools = file_note_tools
+        self.file_note_authorize = file_note_authorize
         self._schedulers = {}
         self._running = set()
         self._closed = False
@@ -98,14 +106,15 @@ class Agent:
     async def run(self, question: str, *, owner: str, tree_id: str, task_id=None,
                   parent_id='latest', attachments=(), thinking_effort='none',
                   supplemental='', publish=None, _events=None, _preview=False, _dispatch=None,
-                  _repository=None, _control=None, _reminder_repository=None, _session_tools=()):
+                  _repository=None, _control=None, _reminder_repository=None, _session_tools=(), _role=None, created_at=None):
         if self._closed:
             raise RuntimeError('Agent 已关闭')
         running = asyncio.current_task()
         self._running.add(running)
-        journal = pool = None
+        journal = None
         try:
-            request = AgentInput(source=_dispatch.kind if _dispatch else 'user', question=question, attachments=list(attachments), thinking_effort=thinking_effort)
+            request = AgentInput(source=_dispatch.kind if _dispatch else 'user', question=question, attachments=list(attachments), thinking_effort=thinking_effort,
+                                 **({'created_at': created_at} if created_at is not None else {}))
             repository = _repository or self.repository(owner, tree_id)
             task, version, created = await repository.begin(request, task_id=task_id, parent_id=parent_id, dispatch=_dispatch)
             if not created:
@@ -124,41 +133,80 @@ class Agent:
             context = context.model_copy(update={'supplemental': supplemental or context.supplemental})
             request = request.model_copy(update={'created_at':task.created_at, 'context':context})
             memory = Memory(repository, self.models.embedding)
+            # 新树接口按实例精确装配；旧 Agent 调用保留原有的默认工具集合。
+            managed = _role is not None
+            custom = [tool for tool in _session_tools if not isinstance(tool,str)]
+            selected = {tool for tool in _session_tools if isinstance(tool,str)}
             entries = [*build_builtin_registrations(), build_progress_tool()]
-            if self.builtin_names is not None:
+            if managed:
+                entries = [tool for tool in entries if tool.name in selected]
+            elif self.builtin_names is not None:
                 known = {entry.name for entry in entries}
                 if self.builtin_names - known:
                     raise ValueError('选择了不存在的内置工具')
                 entries = [entry for entry in entries if entry.name in self.builtin_names]
-            if self.reminder_tools:
+            use_reminders = bool(selected & {'create_reminder', 'list_reminders', 'delete_reminder'}) if managed else self.reminder_tools
+            use_memory = bool(selected & {'search_memory', 'view_memory_query'}) if managed else self.memory_tools
+            use_file_notes = bool(selected & set(FILE_NOTE_TOOL_NAMES)) if managed else self.file_note_tools
+            if use_reminders:
                 journal.reminders = Reminders(_reminder_repository or repository)
-                entries += list(ReminderTools(journal.reminders).registrations())
-            scheduled = task.source in ('heartbeat', 'reminder') and type(self.finish_task) is FinishTask and not self.finish_task.hooks
+                entries += [tool for tool in ReminderTools(journal.reminders).registrations() if not managed or tool.name in selected]
+            if use_file_notes:
+                if not isinstance(repository.storage, FileNoteStore):
+                    raise TypeError('当前存储适配器不支持文件备忘能力（需实现 FileNoteStore）')
+                file_note_cache_pool = create_file_note_cache_pool(scope='task')
+                note_entries = FileNoteTools(
+                    repository.storage,
+                    repository.scope,
+                    authorize=self.file_note_authorize,
+                    cache_pool=file_note_cache_pool,
+                ).registrations()
+                entries += [tool for tool in note_entries if not managed or tool.name in selected]
+            custom_finish = managed and any(tool.name=='finish_task' for tool in custom)
+            scheduled = not custom_finish and task.source in ('heartbeat', 'reminder') and type(self.finish_task) is FinishTask and not self.finish_task.hooks
             journal.allow_prune = scheduled and task.source == 'heartbeat'
             finish = scheduled_finish(journal) if scheduled else self.finish_task.build_registration()
-            entries += [finish, *self.tools, *_session_tools]
-            if self.tool_factory:
+            if not custom_finish:
+                entries.append(finish)
+            if not managed:
+                entries.extend(self.tools)
+            entries.extend(custom)
+            if self.tool_factory and not managed:
                 entries += list(self.tool_factory(ToolContext(repository, journal, memory)))
-            if self.expert_tools:
-                entries += build_external_expert_registrations(
-                    get_pool=lambda: self.experts.get(owner, tree_id), on_audit=journal.record_expert)
             core = AgentCore(self.settings, client=self.models.daily, counter=self.models.count_tokens,
                 options=self.options, registry=ToolRegistry(entries),
-                prompt_builder=partial(build_system_prompt, role=self.role))
-            if self.memory_tools:
-                pool = memory.pool(parent_id=task.parent_id, capacity=self.options.memory_cache_max_queries,
-                    page_size=self.options.memory_page_size)
-                entries += [build_memory_search_registration(pool=pool,
-                    search=partial(memory.search, parent_id=task.parent_id), reference_time=lambda:task.created_at,
-                    core=core, journal=lambda:journal, thinking_effort=thinking_effort),
-                    build_memory_view_registration(MemoryQueryViewer(pool))]
+                prompt_builder=partial(build_system_prompt, role=_role or self.role))
+            if use_memory:
+                memory_cache_pool = create_memory_cache_pool(
+                    capacity=self.options.memory_cache_max_queries,
+                    scope='task',
+                )
+                memory_entries = [
+                    build_memory_search_registration(
+                        search=partial(memory.search, parent_id=task.parent_id),
+                        reference_time=lambda: task.created_at,
+                        core=core,
+                        journal=lambda: journal,
+                        thinking_effort=thinking_effort,
+                        cache_pool=memory_cache_pool,
+                        page_size=self.options.memory_page_size,
+                    ),
+                    build_memory_view_registration(
+                        MemoryQueryViewer(
+                            memory.reader(parent_id=task.parent_id),
+                            cache_pool=memory_cache_pool,
+                            page_size=self.options.memory_page_size,
+                        ),
+                    ),
+                ]
+                entries += [tool for tool in memory_entries if not managed or tool.name in selected]
                 core = core.with_registry(ToolRegistry(entries))
             observer = None
             if _events:
                 # 条件交付/正文转换工具只能在验收后发布，不提前泄露候选正文。
                 safe_preview = all(entry.deliver_output is None and
                     (entry.output_kind is None or all(isinstance(hook, FeedbackOnlyHook) for hook in entry.hooks))
-                    for entry in entries)
+                    for entry in core.registry.entries.values())
                 if _preview and safe_preview:
                     observer = InteractionOutputStream(_events, output_kinds=core.registry.output_kinds())
                 async def committed(kind, text):
@@ -167,8 +215,16 @@ class Agent:
             async def progress(value):
                 if _events:
                     await _events('progress', asdict(value))
-            result = await core.run(request, journal=journal, publish=publish,
-                publish_progress=progress if _events else None, output_observer=observer)
+            # 仅当本轮工具声明了 session 作用域缓存池时才按 (owner, tree_id) 绑定并钉住。
+            if core.registry.has_pools('session'):
+                session_cache = self.cache_scopes.get(owner, tree_id)
+                with session_cache.pin():
+                    result = await core.run(request, journal=journal, publish=publish,
+                        publish_progress=progress if _events else None, output_observer=observer,
+                        _session_cache=session_cache)
+            else:
+                result = await core.run(request, journal=journal, publish=publish,
+                    publish_progress=progress if _events else None, output_observer=observer)
             if journal.pruned:
                 return result
             # 交付失败不撤销答案，但幂等回读也必须保留已确认的交付失败事实。
@@ -194,8 +250,6 @@ class Agent:
             raise
         finally:
             try:
-                if pool is not None:
-                    pool.close()
                 if journal is not None:
                     await journal.flush_audit()
             finally:
@@ -232,9 +286,12 @@ class Agent:
 
     async def close(self):
         await asyncio.gather(*(scheduler.close() for scheduler in tuple(self._schedulers.values())))
+        for session in tuple(self.sessions._residents.values()):
+            if session.managed_heartbeat:
+                await session._scheduler.close()
         if self._running:
             raise RuntimeError('先取消并等待活动任务，再关闭 Agent')
         await self.sessions.close()
         self._closed = True
-        await self.experts.close()
-        # storage 和三个 provider 均由调用方注入，关闭责任留在调用方。
+        self.cache_scopes.close()
+        # storage 和两个 provider 均由调用方注入，关闭责任留在调用方。

@@ -15,17 +15,17 @@
 | 工作区压缩、待提交编辑保护 | `core/subgraph/context_management/workspace_compression/` | 原实现，候选验证后再提交 |
 | 原生工具对、私有推理与纠错轨迹隔离 | `core/native_messages.py`、`core/runtime.py` | 原实现，成功后清除临时失败 |
 | Pydantic 参数、字段说明、工具独立顺序钩子 | `core/tool/registry.py`、`hooks.py` | 原实现；展示与结构化结果分离 |
+| 工具结果对象缓存池、权限受限句柄与事务提交 | `core/tool/cache.py`、`registry.py` | 可选声明，按 `task`/`session` 作用域隔离 LRU，提交确认后落池 |
 | 事务前检查点、提交后回调、幂等任务 | `tasks.py`、`storage.py` | 库拥有状态机，底层数据库只提供 CAS |
 | 任务父链、分支、工作区版本、摘要重启恢复 | `tasks.py` | 库内统一，不委托给消费者重写 |
 | 用户/树隔离、执行中断恢复 | `agent.py`、`tasks.py` | 绑定可信作用域，不自动重放外部副作用 |
 | 公开消息记忆、统一向量、混合召回和来源复核 | `memory.py`、`vectors.py` | 数据库可替换，来源语义固定 |
-| 检索子 Agent、LRU 分页、签名资料、页面折叠 | `core/subgraph/memory_retrieval/`、`core/query_pool.py`、`core/page_display.py` | 原流程和渲染 |
-| 专家求助与续问、独立 LRU、在途保护和审计 | `core/expert.py`、`core/tool/external_expert.py` | 外部 Provider 必须显式注入 |
-| 文件/PDF/图像阅读与授权入口、缓存预算 | `core/file/`、`core/tool/image_viewer.py` | 原能力按需注册，视觉预算显式传入 |
-| 文件检索子 Agent、候选结果查看 | `core/subgraph/file_retrieval/` | 保留通用规划，具体搜索服务由宿主提供 |
-| 网页查询、原文/精炼路径与图片 | `core/web.py`、`core/subgraph/web_page/` | 按需装配，网络和模型配置显式提供 |
+| 检索子 Agent、LRU 分页、签名资料、页面折叠与 `CachePool` 集成 | `core/subgraph/memory_retrieval/`、`core/tool/memory_search.py`、`core/tool/memory_viewer.py`、`core/page_display.py` | 共享 `scope='task'` `CachePool` 存放结果集，正文持续回查权威父链 |
+| 通用 PDF 逐页查看、视觉预算与 `CachePool` 集成 | `core/file/pdf.py`、`core/file/pdf_viewer.py`、`core/tool/pdf_viewer.py` | 按需安装 `agent-core[pdf]`，任意 `file_id`、授权复核与自动关闭驱逐 |
+| 通用文件检索子 Agent、候选分页查看与 `CachePool` 集成 | `core/subgraph/file_retrieval/`、`core/tool/file_search.py`、`core/tool/file_candidates.py` | 解耦为 `FileSearchBackend` 协议，共享 `CachePool` 存放结果集 |
+| 文件备忘持久化、检索二次缩窄与可折叠分页查看 | `file_notes.py`、`core/tool/file_notes.py`、`adapters/sqlite.py`、`adapters/mysql.py` | 按 `scope` 隔离增删查（不覆盖写入），检索与分页共享 `scope='task'` `CachePool` 与签名资料页 |
 | SSE 候选预览、提交确认、中断 | `output_stream.py`、`agent.py` | 保留增量 JSON/Unicode 解码；与普通调用同一 Runtime |
-| 供应商替换、vLLM 默认可用适配 | `providers.py`、`infrastructure/` | 日常、Embedding、专家分别注入 |
+| 供应商替换、vLLM 默认可用适配 | `providers.py`、`infrastructure/` | 日常与 Embedding 分别注入 |
 | wheel、包内模板、独立安装 | `pyproject.toml`、`assets/tool-tag/` | 无 `app.*` 或后端绝对路径依赖 |
 
 `core/journal.NodeJournal` 保留原低层协议供高级宿主适配；通常应使用 `Agent` 与 `Storage`，不要把旧 MySQL repository 接口当作新库的数据库必需接口。
@@ -38,12 +38,12 @@
 
 这些能力可以通过自定义工具、FinishTask 子类和工具钩子接入。高层 Agent 可选启用[空闲心跳、静默裁剪与定时任务](../../capability/application/integration.md#空闲心跳与定时任务)。宿主提供可信用户和任务树范围，以及业务消息交付。
 
-保留的注册中心文件工具只依赖显式文件读取/搜索适配接口，不附带知识后端认证客户端；资源 ID 的兼容约定见相应工具 Schema。全新业务文件 ID 可另注册工具，避免强行套用注册中心约定。
+通用 PDF 查看工具（`view_pdf`）与通用文件检索工具（`search_files`、`view_file_candidates`）均不绑定特定注册中心或业务平台标识，仅依赖宿主显式注入的加载/授权回调与 `FileSearchBackend` 实现，并通过框架 `CachePool` 隔离管理内存句柄。
 
 ---
 
 ## 验证边界
 
-迁移回归涵盖原生工具、失败轨迹清理、工作区、内部压缩、记忆/文件检索与分页反馈；库级测试涵盖 SQLite 原子性、重启、父链分支、外部专家续问、真实模型消息反馈、SSE 与取消、来源隔离、索引空间冲突及提交失败不交付。
+迁移回归涵盖原生工具、失败轨迹清理、工作区、内部压缩、记忆/文件检索与分页反馈；库级测试涵盖 SQLite 原子性、重启、父链分支、真实模型消息反馈、SSE 与取消、来源隔离、索引空间冲突及提交失败不交付。
 
 真实服务实验记录在知识后端 `experiment/agent-core-package/`，结论以每次运行的 analysis.md 为准。不把替身模型测试描述为真实模型压缩质量验证，也不声称已经替换生产数据库或上线新 Agent。

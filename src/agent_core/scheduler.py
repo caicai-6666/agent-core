@@ -123,7 +123,7 @@ class AgentScheduler:
         if tree and tree.value['active']:
             return
         queued = await repo.storage.read(repo.scope, 'runtime_queue')
-        if queued and queued.value['items']:
+        if queued and any(not item.get('deferred') for item in queued.value['items']):
             return
         version = tree.version if tree else None
         queue = await repo.storage.read(repo.scope, 'reminder_queue')
@@ -149,12 +149,14 @@ class AgentScheduler:
                 return
             write = Write('heartbeat', heartbeat.version if heartbeat else None,
                           {**state, 'heartbeat_pending': task_id})
-            dispatch = Dispatch('heartbeat', version, (write,))
+            # 到期提醒在扫描后入队时放弃本次心跳，由下一次领取重新判断。
+            reminder_guard = Write('reminder_queue', queue.version if queue else None, {'items': []})
+            dispatch = Dispatch('heartbeat', version, (write, reminder_guard))
             message = self.settings.heartbeat_message
         if self._stop.is_set():
             return
         # 扫描后若业务输入先入队，领取事务须重新检查，不能越过已经排队的业务任务。
-        guard = Write('runtime_queue', queued.version if queued else None, {'items': []})
+        guard = Write('runtime_queue', queued.version if queued else None, queued.value if queued else {'items': []})
         dispatch = Dispatch(dispatch.kind, version, (*dispatch.writes, guard))
         if session:
             return await session._scheduled(message, task_id, dispatch, self.publish)
@@ -193,6 +195,10 @@ class AgentScheduler:
         finally:
             if worker is not None:
                 await worker
+
+    @property
+    def running(self):
+        return self._worker is not None and not self._worker.done() and not self._stop.is_set()
 
     def start(self):
         if self._stop.is_set() or self.agent._closed:

@@ -6,7 +6,7 @@
 
 原 Core 共 104 个 Python 文件；新库保留其中 100 个。仅进行包命名空间替换后逐字一致的有 93 个，包括 runtime、上下文预算、压缩算法、原生轨迹和工具注册状态机。
 
-以下 7 个文件存在明确适配修改：
+以下 6 个文件存在明确适配修改：
 
 - `src/agent_core/core/file/pdf.py`：解除业务身份/环境配置依赖，或调整通用提示词与显式配置默认值。
 - `src/agent_core/core/model.py`：解除业务身份/环境配置依赖，或调整通用提示词与显式配置默认值。
@@ -14,14 +14,18 @@
 - `src/agent_core/core/prompt/role.py`：解除业务身份/环境配置依赖，或调整通用提示词与显式配置默认值。
 - `src/agent_core/core/subgraph/file_retrieval/schema.py`：解除业务身份/环境配置依赖，或调整通用提示词与显式配置默认值。
 - `src/agent_core/core/tool/__init__.py`：解除业务身份/环境配置依赖，或调整通用提示词与显式配置默认值。
-- `src/agent_core/core/tool/external_expert.py`：解除业务身份/环境配置依赖，或调整通用提示词与显式配置默认值。
 
-以下业务文件不进入通用库，宿主可用工具/提示词接口接回：
+以下业务文件与非核心工具不进入通用库，宿主可用自定义工具/提示词接口按需接回：
 
 - 原 `app/agent/core/prompt/company.py`。
+- 原 `app/agent/core/query_pool.py`：已被通用工具结果对象缓存池 `core/tool/cache.py` 取代，`search_memory` 与 `view_memory_query` 直接基于 `CachePool` 管理结果集生命周期。
 - 原 `app/agent/core/prompt/platform_collaboration.py`。
 - 原 `app/agent/core/tool/platform_a2a.py`。
 - 原 `app/agent/core/tool/sub_management_platform.py`。
+- 联网搜索与网页阅读（原 `web_search`、`web_page`、`web.py`、`subgraph/web_page/`、`public_dns.py`）。
+- 当前时间与日期计算（原 `current_time`、`date_calculator`）。
+- 外部专家会话与适配器（原 `external_expert`、`expert.py`、`infrastructure/deepseek.py`、`config/deepseek.py`）。
+- 注册中心耦合文件与图像查看器（原 `core/tool/registry_file.py`、`core/tool/image_viewer.py`、`core/file/registry_viewer.py`、`core/file/image_viewer.py`、`core/file/cache.py`、`infrastructure/registry_file.py`），已重构为通用的 `core/file/pdf_viewer.py`、`core/tool/pdf_viewer.py`（配合 `agent-core[pdf]` 与 `CachePool`）以及解耦的 `FileSearchBackend` 检索协议。
 
 ---
 
@@ -56,7 +60,6 @@
 | `src/agent_core/assets/tool-tag/glm-5.3-flash.txt` | 包内模型工具格式模板 |
 | `src/agent_core/assets/tool-tag/qwen3.8-flash-next-nvfp4.txt` | 包内模型工具格式模板 |
 | `src/agent_core/config/__init__.py` | 公共 API、持久化编排、数据库或模型适配 |
-| `src/agent_core/config/deepseek.py` | 公共 API、持久化编排、数据库或模型适配 |
 | `src/agent_core/config/mllm.py` | 公共 API、持久化编排、数据库或模型适配 |
 | `src/agent_core/core/__init__.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/context.py` | 迁移原核心模块；职责见机制清单 |
@@ -72,12 +75,9 @@
 | `src/agent_core/core/context_rendering/summary.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/context_rendering/task.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/context_rendering/workspace.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/expert.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/file/__init__.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/file/cache.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/file/image_viewer.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/file/pdf.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/file/registry_viewer.py` | 迁移原核心模块；职责见机制清单 |
+| `src/agent_core/core/file/__init__.py` | 通用 PDF 文档与查看器入口；职责见机制清单 |
+| `src/agent_core/core/file/pdf.py` | 通用 PDF 文档模型与按需渲染（`agent-core[pdf]`）；职责见机制清单 |
+| `src/agent_core/core/file/pdf_viewer.py` | 基于 `CachePool` 的通用 PDF 查看器；职责见机制清单 |
 | `src/agent_core/core/guidance.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/journal.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/json_codec.py` | 迁移原核心模块；职责见机制清单 |
@@ -91,7 +91,6 @@
 | `src/agent_core/core/prompt/interaction.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/prompt/role.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/prompt/workspace.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/query_pool.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/runtime.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/subgraph/__init__.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/subgraph/context_management/__init__.py` | 迁移原核心模块；职责见机制清单 |
@@ -110,8 +109,9 @@
 | `src/agent_core/core/subgraph/context_management/workspace_compression/errors.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/subgraph/context_management/workspace_compression/pending.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/subgraph/context_management/workspace_compression/runtime.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/subgraph/file_retrieval/__init__.py` | 迁移原核心模块；职责见机制清单 |
+| `src/agent_core/core/subgraph/file_retrieval/__init__.py` | 通用文件检索子图与后端协议；职责见机制清单 |
 | `src/agent_core/core/subgraph/file_retrieval/agent.py` | 迁移原核心模块；职责见机制清单 |
+| `src/agent_core/core/subgraph/file_retrieval/backend.py` | 通用 `FileSearchBackend` 协议与配置数据结构 |
 | `src/agent_core/core/subgraph/file_retrieval/pool.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/subgraph/file_retrieval/prompt.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/subgraph/file_retrieval/ranking.py` | 迁移原核心模块；职责见机制清单 |
@@ -127,44 +127,26 @@
 | `src/agent_core/core/subgraph/memory_retrieval/session.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/subgraph/memory_retrieval/tool.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/subgraph/memory_retrieval/workflow.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/subgraph/web_page/__init__.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/subgraph/web_page/image.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/subgraph/web_page/node.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/subgraph/web_page/prompt.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/subgraph/web_page/routing.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/subgraph/web_page/schema.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/subgraph/web_page/state.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/subgraph/web_page/workflow.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/__init__.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/base/__init__.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/base/finish_task.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/context.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/tool/current_time.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/tool/date_calculator.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/tool/external_expert.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/feedback.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/file_candidates.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/file_search.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/hooks.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/tool/image_viewer.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/memory_search.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/memory_viewer.py` | 迁移原核心模块；职责见机制清单 |
+| `src/agent_core/core/tool/pdf_viewer.py` | 通用 `view_pdf` 工具注册与渲染钩子 |
 | `src/agent_core/core/tool/progress.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/registry.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/tool/registry_file.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/result.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/tool/web_page.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/tool/web_search.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/tool/workspace.py` | 迁移原核心模块；职责见机制清单 |
-| `src/agent_core/core/web.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/core/workspace.py` | 迁移原核心模块；职责见机制清单 |
 | `src/agent_core/infrastructure/__init__.py` | 公共 API、持久化编排、数据库或模型适配 |
-| `src/agent_core/infrastructure/deepseek.py` | 公共 API、持久化编排、数据库或模型适配 |
 | `src/agent_core/infrastructure/mllm.py` | 公共 API、持久化编排、数据库或模型适配 |
 | `src/agent_core/infrastructure/model_concurrency.py` | 公共 API、持久化编排、数据库或模型适配 |
 | `src/agent_core/infrastructure/pdf_lock.py` | 公共 API、持久化编排、数据库或模型适配 |
-| `src/agent_core/infrastructure/public_dns.py` | 公共 API、持久化编排、数据库或模型适配 |
-| `src/agent_core/infrastructure/registry_file.py` | 公共 API、持久化编排、数据库或模型适配 |
 | `src/agent_core/infrastructure/tool_tag.py` | 公共 API、持久化编排、数据库或模型适配 |
 | `src/agent_core/infrastructure/vllm_tokenizer.py` | 公共 API、持久化编排、数据库或模型适配 |
 | `src/agent_core/memory.py` | 公共 API、持久化编排、数据库或模型适配 |
@@ -186,7 +168,6 @@
 | `tests/helpers.py` | 隔离回归或测试装配 |
 | `tests/test_compaction_internal_feedback.py` | 隔离回归或测试装配 |
 | `tests/test_context_feedback.py` | 隔离回归或测试装配 |
-| `tests/test_date_calculation_feedback.py` | 隔离回归或测试装配 |
 | `tests/test_file_candidates_feedback.py` | 隔离回归或测试装配 |
 | `tests/test_file_search_feedback.py` | 隔离回归或测试装配 |
 | `tests/test_library.py` | 隔离回归或测试装配 |

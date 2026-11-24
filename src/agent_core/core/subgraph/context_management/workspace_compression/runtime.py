@@ -9,6 +9,7 @@ from ....context_rendering.block import metadata_block
 from ....json_codec import load_model_json,validate_model_payload,ModelActionRejected,model_validation_feedback
 from ....tool.workspace import prepare_workspace_edit, _MODELS, build_workspace_registrations
 from ....tool.hooks import ToolHookContext
+from ....tool.retry import ToolFailureTracker
 from ....tool.registry import ToolRegistry
 from ....tool.result import OrdinaryToolContent, ToolExecution
 from ....prompt.guidance import build_system_guidence_message
@@ -83,6 +84,8 @@ async def compress_workspace(*,workspace,generate,counter,generation,context_win
     async def count(value):
         return validate_count(await counter([{'role':'user','content':render_workspace_section(value)}],[],generation))
     tokens=await count(workspace)
+    failures = ToolFailureTracker(max_errors)
+    tool_names = {tool['function']['name'] for tool in tools}
     for _ in range(max_rounds):
         messages=deepcopy(base+history+temporary+[{'role':'user','content':'# 最新工作区\n'+
             capacity_feedback(tokens,token_budget)+'\n'+render_workspace_section(workspace)}])
@@ -126,6 +129,9 @@ async def compress_workspace(*,workspace,generate,counter,generation,context_win
                 error=model_validation_feedback(error,argument_model if argument_model and error.title==argument_model.__name__ else WorkspacePayload)
             reason=(error.reason if isinstance(error,ModelActionRejected) else '本次整理未通过校验，修改未接受。')
             action=(error.required_action if isinstance(error,ModelActionRejected) else '依据最新工作区和已提供的保护约束选择合法编辑，不能假定本次修改已生效。')
+            name = response.tool_calls[0].name if len(response.tool_calls) == 1 else None
+            if name in tool_names:
+                action = failures.feedback(action, name, getattr(error, 'reason_code', None) or reason)
             temporary.append(build_system_guidence_message(kind='invalid_action',reason=reason,
                 required_action=action+tool_tag_section(tool_call_template)))
             continue
@@ -139,6 +145,7 @@ async def compress_workspace(*,workspace,generate,counter,generation,context_win
                 capacity=capacity_feedback(next_tokens, token_budget),
             ),
         )
+        failures.success(call.name)
         workspace,tokens=candidate,next_tokens
         errors=0
         temporary.clear()

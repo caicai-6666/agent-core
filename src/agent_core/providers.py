@@ -1,10 +1,9 @@
-"""三类模型契约：连接归调用方所有，库不读取环境或猜测供应商协议。"""
+"""两类模型契约：连接归调用方所有，库不读取环境或猜测供应商协议。"""
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, Literal
+from typing import Callable, Protocol, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .config.mllm import MLLMGenerationSettings, MLLMSettings
 from .infrastructure.mllm import MLLMCompletion, MLLMClient
-from .infrastructure.deepseek import DeepSeekCompletion as ExpertReply
 from .infrastructure.vllm_tokenizer import count_chat_tokens
 
 
@@ -35,20 +34,15 @@ class EmbeddingProvider(Protocol):
     async def embed(self, texts: list[str], *, purpose: Literal['query', 'document']) -> list[list[float]]: ...
 
 
-class ExpertProvider(Protocol):
-    async def create_response(self, *, input_items: list[dict[str, Any]]) -> ExpertReply: ...
-
-
 @dataclass(frozen=True)
 class Models:
     daily: ChatProvider
     embedding: EmbeddingProvider
-    expert: ExpertProvider
     count_tokens: Callable
 
     def __post_init__(self):
         for value, method in ((self.daily, 'create_chat_completion'),
-                              (self.embedding, 'embed'), (self.expert, 'create_response')):
+                              (self.embedding, 'embed')):
             if not callable(getattr(value, method, None)):
                 raise TypeError(f'必须提供模型接口 {method}')
         if not callable(self.count_tokens):
@@ -61,31 +55,6 @@ def vllm_counter(settings: MLLMSettings):
     async def count(messages, tools, generation):
         return await count_chat_tokens(messages, tools, settings, generation=generation)
     return count
-
-
-class ChatExpert:
-    """将任意日常聊天接口适配为独立专家；可注入另一套 vLLM 或外部 API 配置。"""
-    def __init__(self, client: ChatProvider, *, generation=None):
-        self.client = client
-        self.generation = generation or MLLMGenerationSettings()
-
-    async def create_response(self, *, input_items):
-        messages = []
-        for item in input_items:
-            content = item.get('content', '')
-            if isinstance(content, list):
-                content = ''.join(part.get('text', '') for part in content if part.get('type') == 'output_text')
-            if item.get('role') in ('user', 'system', 'assistant'):
-                messages.append({'role': item['role'], 'content': content})
-        response = await self.client.create_chat_completion(messages=messages, generation=self.generation)
-        output = {'type': 'message', 'role': 'assistant',
-                  'content': [{'type': 'output_text', 'text': response.content or ''}]}
-        complete = response.finish_reason == 'stop' and not response.tool_calls
-        usage = response.usage
-        # 专家协议保留原响应用于审计；主助手只读取确认完成的文字。
-        raw = {**response.raw_response, 'output': [output], 'status': 'completed' if complete else 'incomplete'}
-        return ExpertReply(response.response_id, response.model, response.content or '', raw['status'],
-            usage.get('prompt_tokens'), usage.get('completion_tokens'), usage.get('total_tokens'), raw, (output,))
 
 
 class OpenAIEmbedding:

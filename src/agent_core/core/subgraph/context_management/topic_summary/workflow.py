@@ -13,6 +13,7 @@ from .schema import (SummaryTopic, FinishPlanningArguments, TopicGenerationOutpu
 from .prompt import build_topic_planning_prompt, TOPIC_GENERATION_PROMPT
 from .rendering import prepare_sources, render_material, render_topic
 from .sampling import summary_generation
+from ....tool.retry import ToolFailureTracker
 from ....tool.registry import RegisteredTool, ToolRegistry
 from ....tool.result import OrdinaryToolContent, ToolExecution
 
@@ -68,6 +69,8 @@ async def plan_topics(tasks, previous, *, focus, generate, counter, generation, 
     temporary = []
     errors = 0
     accepted_feedback = []
+    failures = ToolFailureTracker(max_errors)
+    tool_names = {tool['function']['name'] for tool in tools}
     for _ in range(96):
         # 权威主题集合每轮重建；合法动作后清除整段错误调用及反馈。
         from ....context_rendering.block import metadata_block
@@ -110,6 +113,7 @@ async def plan_topics(tasks, previous, *, focus, generate, counter, generation, 
                     },
                     {'role': 'tool', 'tool_call_id': call.call_id, 'content': execution.result.content.text},
                 ]
+                failures.success(call.name)
                 errors = 0
                 temporary.clear()
             elif call.name == 'finish_topic_planning':
@@ -127,6 +131,9 @@ async def plan_topics(tasks, previous, *, focus, generate, counter, generation, 
                 error=model_validation_feedback(error,argument_model)
             reason=error.reason if isinstance(error,ModelActionRejected) else '本次主题规划未通过校验，主题集合未修改。'
             action=error.required_action if isinstance(error,ModelActionRejected) else '按当前规划工具的字段说明选择合法动作，不添加未提供的来源。'
+            name = response.tool_calls[0].name if len(response.tool_calls) == 1 else None
+            if name in tool_names:
+                action = failures.feedback(action, name, getattr(error, 'reason_code', None) or reason)
             temporary.append({'role': 'user', 'content': reason+'\n'+action+tool_tag_section(tool_call_template)})
     raise ValueError('主题规划超过最大轮数')
 

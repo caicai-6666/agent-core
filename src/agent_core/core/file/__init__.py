@@ -1,9 +1,23 @@
-"""Core 用户附件的按需页面模型和 LRU 驻留池。"""
-from .pdf import FileModel,PDFOpenError,PDFRenderConfig,PDFPage
-from .cache import FileKey,FileModelCache,FileCacheBusyError
-from .image_viewer import ImageFileViewer,FileViewError
+"""通用 PDF 文档模型与基于 CachePool 的逐页查看器。"""
+from .pdf import (
+    DEFAULT_PDF_CACHE_POOL,
+    PDFDocument,
+    PDFOpenError,
+    PDFPage,
+    PDFRenderConfig,
+    PDFSource,
+    create_pdf_cache_pool,
+)
+from .pdf_viewer import PDFViewError, PDFViewer
 
-__all__=['FileModel','PDFOpenError','PDFRenderConfig','PDFPage','FileKey','FileModelCache','FileCacheBusyError',
-    'ImageFileViewer','FileViewError','RegistryFileViewer']
-
-from .registry_viewer import RegistryFileViewer
+__all__ = [
+    'DEFAULT_PDF_CACHE_POOL',
+    'PDFDocument',
+    'PDFOpenError',
+    'PDFPage',
+    'PDFRenderConfig',
+    'PDFSource',
+    'PDFViewError',
+    'PDFViewer',
+    'create_pdf_cache_pool',
+]
