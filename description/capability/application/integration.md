@@ -62,6 +62,7 @@ await database.close()
 - `external_id` 在本实例的任务作用域内去重；相同输入并发投递共用任务 ID，冲突输入报错。持久树的收据跨重启保留。使用 `latest` 时较早的任务仍有收据，完整结果回读遵循历史工作区保留策略。
 - `created_at` 可传业务事件的带时区时间，用作模型的任务时间。省略时取提交时间。
 - `deferred=True` 登记任务后等待显式激活；宿主可在首次订阅时调用 `await job.activate()`。重启后恢复实例并调用 `await agent.activate(task_id)` 可重新获得句柄。等待激活的任务不会阻塞其他已就绪任务。
+- `guidance_factory` 可在 `create`、`restore` 绑定会话默认临时请求提示策略（如 `ProgressGuidance.factory(interval_seconds=60.0)`），也可在 `generate(..., guidance_factory=...)` 按单任务覆盖或传 `None` 临时关闭。工厂为进程内 Python 回调，不写入持久队列 JSON；`ProgressGuidance.factory(...)` 支持按参数值比较相等，便于持久实例 `restore` 核对配置一致性，空闲驱逐后冷重绑自动保留原工厂。
 - `agent.recover(task_id)` 用于宿主确认旧执行进程已经停止后的故障收束。任务不会重放。
 - 新接口使用数据库内固定的树命名空间。接续旧 `Agent` 创建的树时，用 `AgentRuntime(..., legacy_owner=原owner)` 绑定其原有命名空间；原数据库的执行模式与工作区策略继续有效。拥有同名树的多个旧 owner 应分别绑定。
 
@@ -374,10 +375,10 @@ from agent_core import (
 )
 
 search_pool = create_file_search_cache_pool(name="file_search_results", capacity=10, scope="task")
+# 省略 core、journal、thinking_effort 时，执行期自动通过 current_tool_runtime() 解析当前任务上下文，
+# 可直接静态传入 AgentRuntime.create(tools=[search_tool, candidates_tool])。
 search_tool = build_file_search_registration(
     backend=my_backend,
-    core=core,
-    journal=lambda: current_journal,
     cache_pool=search_pool,
 )
 candidates_tool = build_file_candidates_registration(
@@ -385,6 +386,7 @@ candidates_tool = build_file_candidates_registration(
 )
 ```
 
+- **动态解析与显式兼容**：`build_file_search_registration` 省略 `core`、`journal`、`thinking_effort` 时，在 `execute` 期间自动从 `current_tool_runtime()` 读取当前任务的宿主核心、日志（子检索审计记录写入主任务 `generation:*`）与推理档位；底层直接调用 `AgentCore` 时仍兼容显式传入 `core`、`journal`（支持实例或无参回调）和 `thinking_effort`。
 - **共享 `CachePool` 与二次缩窄**：`search_files` 声明对 `cache_pool` 的读写权限，将 `FileSearchResultSet` 随 `journal.commit` 原子写入缓存池，并支持传入已有 `result_id` 在原结果集范围内二次检索；`result_id` 缺失或失效时返回 `correctable` 反馈。
 - **权威回查与折叠分页**：`view_file_candidates` 仅声明只读权限，按页回查 `backend.read(ids)` 获取最新文件元信息与权限状态，不在缓存池中保存文件名或摘要；缓存驱逐或作用域关闭时触发 `on_evict` 使结果集失效，阻止旧页面引用继续解析。
 
@@ -411,3 +413,37 @@ agent = await runtime.create(
 - **可选授权回调**：提供 `file_note_authorize(file_id)` 时，`add_file_note` 在写入前执行授权校验；返回 `False` 或抛出 `FileNoteRejected` 均返回可纠正失败，不写入数据库。
 - **检索、二次缩窄与可折叠分页**：`search_file_notes` 支持中英文文件名/摘要关键词（`and`/`or`）、时间窗口（`start_time` 含、`end_time` 不含）及基于已有 `query_id` 的二次缩窄，命中结果经 `scope="task"` 的 `CachePool` 随 `journal.commit` 原子发布（最多保留 1000 条并向二次缩窄传递截断标记；空结果不入池）。`view_file_note_query` 只读消费同一 `CachePool`，以 HMAC 签名的 `FoldableToolContent` 按页展开；缓存失效或驱逐时返回 `correctable` 反馈并阻止旧页面引用解析。
 - **作用域隔离**：不同 `owner`、不同 `tree_id` 及冻结分身（`restore(..., persist_new_nodes=False)`）的备忘完全隔离。
+
+---
+
+## 临时请求提示与工具运行时上下文
+
+### 临时请求提示（`RequestGuidance` / `ProgressGuidance`）
+
+`RequestGuidance` 用于在单次模型请求前注入临时操作提示（如开场阶段进展引导、周期进展提醒），仅附加到当轮发往模型的消息末尾，**不写入已提交历史、工作区或压缩摘要**。
+
+```python
+from agent_core import AgentRuntime, ProgressGuidance
+
+guidance = ProgressGuidance.factory(interval_seconds=60.0)
+agent = await runtime.create(
+    tree_id="project-42",
+    role=project_role,
+    tools=["emit_progress", "workspace_add"],
+    guidance_factory=guidance,
+)
+# 单个任务可临时覆盖或传 None 关闭：
+job = await agent.generate("快速确认一个字段", guidance_factory=None)
+```
+
+- **开场与周期计时**：`ProgressGuidance` 在第 1 轮返回开场提示并记录起始时间；后续轮次若距上次计时已达到 `interval_seconds`（默认 60 秒）则返回周期提醒并重置计时；每次公开输出（`emit_progress`、`finish_task`）提交并交付后通过 `after_output` 重置计时。
+- **可裁剪与校验**：`interval_seconds=None` 关闭周期提醒（非 `None` 时必须为有限正数，拒绝 `bool`）；`opening_prompt=None` 或 `reminder_prompt=None` 分别关闭对应提示。消息统一经 `build_system_guidence_message` 生成（`action_guidance`），不含工程元信息。
+- **透传范围**：`Agent`、`AgentRuntime.create`、`AgentRuntime.restore`（含持久恢复、空闲驱逐后冷重绑与冻结分身）及 `TreeAgent.generate` 均支持 `guidance_factory`。
+
+### 工具运行时上下文（`ToolRuntimeContext` / `current_tool_runtime`）
+
+自定义组合工具（如内部需要复用主任务模型客户端、写入主任务生成审计或读取当前推理档位的子循环工具）可在 `execute` 期间调用 `current_tool_runtime()` 获取当前任务的只读 `ToolRuntimeContext(core, journal, thinking_effort)`：
+
+- `AgentCore._run_loop` 在每次工具执行边界内通过 `ContextVar` 自动绑定并在退出时恢复。
+- 在工具 `execute` 之外调用 `current_tool_runtime()` 抛出 `RuntimeError`。
+- `build_file_search_registration` 即基于该机制支持静态构造后直接传入 `AgentRuntime.create(tools=[...])`。

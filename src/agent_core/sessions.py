@@ -16,6 +16,8 @@ from .scheduler import Dispatch, Reminders, SchedulerSettings, utc_now
 from .storage import StorageConflict, Write
 from .tasks import TaskRepository
 
+_UNSET = object()
+
 
 class SessionExpired(RuntimeError):
     """内存会话释放后不能以同一引用继续。"""
@@ -168,11 +170,14 @@ class Session:
         self.repository = repository
         self.role = None
         self.tools = tuple(tools)
+        self.guidance_factory = None
         self._scheduler = None
         self.managed_heartbeat = None
         self._reminder_repository = reminder_repository
         self._lock = asyncio.Lock()
         self._tickets = {}
+        # 单任务 guidance_factory 覆盖为进程内回调，不写入持久队列 JSON，任务终态或会话释放时清理。
+        self._task_guidance = {}
         self._active = self._worker = None
         self._expired = False
         self._pins = 0
@@ -217,7 +222,8 @@ class Session:
         return [*items, item], item['id']
 
     async def submit(self, question, *, priority=0, merge_with_previous=False, source='user', attachments=(), thinking_effort='none',
-                     supplemental='', replace_task_id=None, preview=True, external_id=None, created_at=None, deferred=False):
+                     supplemental='', replace_task_id=None, preview=True, external_id=None, created_at=None, deferred=False,
+                     guidance_factory=_UNSET):
         if type(priority) is not int or source not in ('user', 'business') or not isinstance(supplemental, str):
             raise ValueError('需要整数优先级、有效输入来源和文本上下文')
         if type(preview) is not bool:
@@ -230,6 +236,8 @@ class Session:
             raise ValueError('merge_with_previous 必须为布尔值')
         if merge_with_previous and (deferred or replace_task_id is not None):
             raise ValueError('只有就绪的普通输入可以请求合并')
+        if guidance_factory is not _UNSET and guidance_factory is not None and not callable(guidance_factory):
+            raise TypeError('guidance_factory 必须可调用或为 None')
         request = AgentInput(question=question, attachments=list(attachments), source=source, thinking_effort=thinking_effort,
                              **({'created_at':created_at} if created_at is not None else {}))
         ticket = SessionTask(new_tree_id())
@@ -282,6 +290,8 @@ class Session:
             if identifier != ticket.id:
                 ticket = self._tickets.get(identifier) or SessionTask(identifier)
             self._tickets[ticket.id] = ticket
+            if guidance_factory is not _UNSET:
+                self._task_guidance[ticket.id] = guidance_factory
             ticket._activate, ticket._wake_observer = self.activate, self._wake
             if deferred:
                 ticket.status = 'pending_activation'
@@ -334,7 +344,8 @@ class Session:
         try:
             result = await self.runtime.agent.run(message, owner=self.owner, tree_id=self.id,
                 task_id=identifier, publish=publish, _dispatch=dispatch, _control=active.control,
-                _repository=self.repository, _reminder_repository=self._reminder_repository, _session_tools=self.tools, _role=self.role)
+                _repository=self.repository, _reminder_repository=self._reminder_repository, _session_tools=self.tools, _role=self.role,
+                **({'_guidance_factory': self.guidance_factory} if self.guidance_factory is not None else {}))
             await ticket.finish('completed', result=result)
             return result
         except asyncio.CancelledError:
@@ -402,6 +413,7 @@ class Session:
                     raise
                 await ticket.finish('failed', error=StorageConflict('原任务未被替代，未执行新指令'))
                 self._tickets.pop(identifier)
+                self._task_guidance.pop(identifier, None)
                 continue
             if task.status == 'generating':
                 ticket.status = 'running'
@@ -419,6 +431,7 @@ class Session:
                          else RuntimeError('任务执行失败，请回查任务记录'))
                 await ticket.finish(task.status, error=error)
             self._tickets.pop(identifier)
+            self._task_guidance.pop(identifier, None)
 
     async def _select_next(self, ready, queue):
         # 定向替代紧随旧任务，普通业务按优先级及到达顺序领取。
@@ -477,6 +490,7 @@ class Session:
                                     continue
                                 await ticket.finish('failed', error=StorageConflict('原任务未被替代，未执行新指令'))
                                 self._tickets.pop(ticket.id)
+                                self._task_guidance.pop(ticket.id, None)
                                 continue
                         dispatch = Dispatch(item['source'], tree.version if tree else None, writes)
                         self._active = _Active(ticket, _Control())
@@ -487,12 +501,19 @@ class Session:
                 try:
                     scheduled = item['source']=='reminder'
                     scheduler = self._scheduler or self.runtime.agent._schedulers.get((self.owner,self.id))
+                    task_guidance = self._task_guidance.get(ticket.id, _UNSET)
+                    effective_guidance = (
+                        task_guidance
+                        if task_guidance is not _UNSET
+                        else (self.guidance_factory if self.guidance_factory is not None else _UNSET)
+                    )
                     result = await self.runtime.agent.run(item['question'], owner=self.owner, tree_id=self.id,
                         task_id=ticket.id, attachments=item['attachments'], thinking_effort=item['thinking_effort'],
                         supplemental=item['supplemental'], _events=None if scheduled else ticket.emit,
                         publish=scheduler.publish if scheduled and scheduler else None, _preview=item.get('preview', True),
                         _repository=repo, _reminder_repository=self._reminder_repository, _session_tools=self.tools,
-                        _control=self._active.control, _dispatch=dispatch, _role=self.role, created_at=item.get('created_at'))
+                        _control=self._active.control, _dispatch=dispatch, _role=self.role, created_at=item.get('created_at'),
+                        **({'_guidance_factory': effective_guidance} if effective_guidance is not _UNSET else {}))
                 except StorageConflict as error:
                     # 入队/领取竞争只在请求仍留队时重选；已开始的工具绝不重放。
                     if not self._active.control.started:
@@ -517,6 +538,7 @@ class Session:
                     self._active = None
                     if ticket._done.is_set():
                         self._tickets.pop(ticket.id, None)
+                        self._task_guidance.pop(ticket.id, None)
                     self.touched = monotonic()
         except Exception as error:
             # 存储不可用时唤醒所有等待方。未领取的持久请求仍可在恢复后处理。
@@ -524,6 +546,7 @@ class Session:
                 for ticket in self._tickets.values():
                     await ticket.finish('failed', error=error)
                 self._tickets.clear()
+                self._task_guidance.clear()
                 self._worker = self._active = None
 
     async def snapshot(self, task_id=None):
@@ -561,6 +584,7 @@ class SessionRuntime:
         for ticket in session._tickets.values():
             await ticket.finish('expired',error=SessionExpired('本地任务句柄已释放；持久树可使用任务 ID 重新激活'))
         session._tickets.clear()
+        session._task_guidance.clear()
         # 调用者可以长期持有公开句柄，驱逐时必须主动释放深复制的历史与工作区。
         session.repository.baseline = ContextInjection()
         session.repository.snapshot = session.repository.baseline
@@ -605,9 +629,11 @@ class SessionRuntime:
             await self._release(session)
 
     async def _open(self, owner, identifier, kind, mode, baseline, reminders=None, tools=(), *, role=None,
-                    retention=None, create=False, heartbeat=None):
+                    retention=None, create=False, heartbeat=None, guidance_factory=None):
         if mode not in ('queue', 'interruptible') or not owner.strip() or not identifier.strip():
             raise ValueError('需要有效用户、会话标识和执行模式')
+        if guidance_factory is not None and not callable(guidance_factory):
+            raise TypeError('guidance_factory 必须可调用或为 None')
         if heartbeat is not None:
             heartbeat = SchedulerSettings.model_validate(heartbeat)
             if mode != 'queue' or heartbeat.heartbeat_interval_seconds < 1:
@@ -620,7 +646,8 @@ class SessionRuntime:
             if existing is not None:
                 if create:
                     raise StorageConflict('该树已存在')
-                if existing.kind != kind or existing.mode != mode or existing.tools != tuple(tools) or existing.role != role:
+                if (existing.kind != kind or existing.mode != mode or existing.tools != tuple(tools)
+                        or existing.role != role or existing.guidance_factory != guidance_factory):
                     raise StorageConflict('同一会话已绑定其他形态或执行模式')
                 if heartbeat is not None and heartbeat != existing.managed_heartbeat:
                     raise StorageConflict('该树已绑定其他心跳策略')
@@ -642,6 +669,7 @@ class SessionRuntime:
                                        workspace_retention=(retention or self.agent.workspace_retention) if kind == 'persistent' else 'per_node')
             session = Session(self, owner, identifier, kind, mode, repo, reminders or repo, tools)
             session.role = role
+            session.guidance_factory = guidance_factory
             if kind == 'persistent':
                 policy_value = {'mode': mode}
                 if heartbeat is not None:
@@ -684,17 +712,17 @@ class SessionRuntime:
                 self._maintenance = asyncio.create_task(self._maintain())
             return session
 
-    async def persistent(self, *, owner, tree_id, mode='queue', tools=()):
-        return await self._open(owner, tree_id, 'persistent', mode, ContextInjection(), tools=tools)
+    async def persistent(self, *, owner, tree_id, mode='queue', tools=(), guidance_factory=None):
+        return await self._open(owner, tree_id, 'persistent', mode, ContextInjection(), tools=tools, guidance_factory=guidance_factory)
 
-    async def memory(self, *, owner, context=None, mode='queue', tools=()):
-        return await self._open(owner, new_tree_id(), 'memory', mode, context or ContextInjection(), tools=tools)
+    async def memory(self, *, owner, context=None, mode='queue', tools=(), guidance_factory=None):
+        return await self._open(owner, new_tree_id(), 'memory', mode, context or ContextInjection(), tools=tools, guidance_factory=guidance_factory)
 
-    async def fork(self, parent, *, task_id=None, mode='queue', tools=()):
+    async def fork(self, parent, *, task_id=None, mode='queue', tools=(), guidance_factory=None):
         if parent.runtime is not self or parent.kind != 'persistent':
             raise ValueError('冻结分身必须绑定本运行时的持久会话')
         snapshot = await parent.snapshot(task_id)
-        return await self._open(parent.owner, new_tree_id(), 'fork', mode, snapshot, self.agent.repository(parent.owner, parent.id), tools)
+        return await self._open(parent.owner, new_tree_id(), 'fork', mode, snapshot, self.agent.repository(parent.owner, parent.id), tools, guidance_factory=guidance_factory)
 
     async def get(self, *, owner, session_id):
         async with self._lock:

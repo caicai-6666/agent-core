@@ -4,7 +4,7 @@ from .core.tool import BaseTool, RegisteredTool, ToolRegistry, build_builtin_reg
 from .core.model import ContextInjection
 from .model.question_tree import new_tree_id
 from .scheduler import SchedulerSettings
-from .sessions import SessionExpired
+from .sessions import SessionExpired, _UNSET
 from .tasks import TaskRepository
 
 
@@ -48,17 +48,21 @@ class TreeAgent:
             raise SessionExpired('实例已关闭')
         session = self._session
         if self.persist_new_nodes:
-            # 公开句柄可长期持有，驱逐只释放驻留上下文。重新绑定时仍验证执行配置。
-            session = await self._runtime._restore_session(session.runtime.agent,self.tree_id,session.role,session.tools,session.mode)
+            # 公开句柄可长期持有，驱逐只释放驻留上下文。重新绑定时仍验证执行配置并保留提示工厂。
+            session = await self._runtime._restore_session(
+                session.runtime.agent, self.tree_id, session.role, session.tools, session.mode,
+                guidance_factory=session.guidance_factory,
+            )
             self._session = session
         return session
 
     async def generate(self, question, *, priority=0, merge_with_previous=False, external_id=None, created_at=None,
-                       deferred=False, source='user', attachments=(), thinking_effort='none', supplemental='', preview=True):
+                       deferred=False, source='user', attachments=(), thinking_effort='none', supplemental='', preview=True,
+                       guidance_factory=_UNSET):
         session = await self._resident()
         return await session.submit(question,priority=priority,merge_with_previous=merge_with_previous,external_id=external_id,created_at=created_at,
             deferred=deferred,source=source,attachments=attachments,thinking_effort=thinking_effort,
-            supplemental=supplemental,preview=preview)
+            supplemental=supplemental,preview=preview,guidance_factory=guidance_factory)
 
     async def activate(self, task_id):
         return await (await self._resident()).activate(task_id)
@@ -122,16 +126,17 @@ class AgentRuntime:
             raise KeyError('数据库中不存在指定树')
         return repo, tree.value
 
-    async def _restore_session(self, engine, tree_id, role, tools, mode, heartbeat=None):
+    async def _restore_session(self, engine, tree_id, role, tools, mode, heartbeat=None, *, guidance_factory=None):
         repo, tree = await self._metadata(engine,tree_id)
         if mode is None:
             policy = await repo.storage.read(repo.scope,'runtime_session')
             mode = policy.value['mode'] if policy else 'queue'
         return await engine.sessions._open(self._owner,tree_id,'persistent',mode,ContextInjection(),
-            tools=tools,role=role,retention=tree.get('workspace_retention','per_node'),heartbeat=heartbeat)
+            tools=tools,role=role,retention=tree.get('workspace_retention','per_node'),heartbeat=heartbeat,
+            guidance_factory=guidance_factory)
 
     async def create(self, *, tree_id, role, database=None, tools=(), persist_new_nodes=True, execution_mode='queue',
-                     workspace_retention='per_node', heartbeat: SchedulerSettings | None = None):
+                     workspace_retention='per_node', heartbeat: SchedulerSettings | None = None, guidance_factory=None):
         engine = self._engine_for(database)
         tools = _instance_tools(tools)
         if not isinstance(role,str) or not role.strip() or type(persist_new_nodes) is not bool:
@@ -142,11 +147,12 @@ class AgentRuntime:
             raise ValueError('创建持久树需要已准备的数据库')
         owner = self._owner if persist_new_nodes else 'agent-core:memory'
         session = await engine.sessions._open(owner,tree_id,'persistent' if persist_new_nodes else 'memory',
-            execution_mode,ContextInjection(),tools=tools,role=role,retention=workspace_retention,create=True,heartbeat=heartbeat)
+            execution_mode,ContextInjection(),tools=tools,role=role,retention=workspace_retention,create=True,
+            heartbeat=heartbeat,guidance_factory=guidance_factory)
         return TreeAgent(self,session,tree_id)
 
     async def restore(self, *, tree_id, role, database=None, tools=(), persist_new_nodes=True, execution_mode=None,
-                      start_node_id=None, heartbeat: SchedulerSettings | None = None):
+                      start_node_id=None, heartbeat: SchedulerSettings | None = None, guidance_factory=None):
         engine = self._engine_for(database)
         tools = _instance_tools(tools)
         if not isinstance(role,str) or not role.strip() or type(persist_new_nodes) is not bool:
@@ -154,7 +160,8 @@ class AgentRuntime:
         if persist_new_nodes:
             if start_node_id is not None:
                 raise ValueError('历史起点用于派生分身，持久实例恢复当前树头')
-            session = await self._restore_session(engine,tree_id,role,tools,execution_mode,heartbeat)
+            session = await self._restore_session(engine,tree_id,role,tools,execution_mode,heartbeat,
+                                                  guidance_factory=guidance_factory)
         else:
             if heartbeat is not None:
                 raise ValueError('分身使用本体的心跳策略')
@@ -164,7 +171,7 @@ class AgentRuntime:
             node = tree['head'] if start_node_id is None else start_node_id
             context = await repo.context(node)
             session = await engine.sessions._open(self._owner,new_tree_id(),'fork','queue' if execution_mode is None else execution_mode,
-                context,reminders=repo,tools=tools,role=role)
+                context,reminders=repo,tools=tools,role=role,guidance_factory=guidance_factory)
         return TreeAgent(self,session,tree_id)
 
     async def close(self):

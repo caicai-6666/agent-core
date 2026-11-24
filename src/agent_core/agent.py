@@ -32,6 +32,9 @@ class FinishTask(FinishTaskTool):
     description = '完成当前任务并保存完整最终答复；说明已完成事实与尚未解决的问题，不把计划或工具尝试说成执行成功。'
 
 
+_UNSET = object()
+
+
 @dataclass(frozen=True)
 class ToolContext:
     repository: TaskRepository
@@ -53,6 +56,7 @@ class Agent:
                  tools=(), tool_factory=None, builtin_names=None, finish_task=None,
                  memory_tools=True, reminder_tools=False,
                  file_note_tools: bool = False, file_note_authorize=None,
+                 guidance_factory=None,
                  session_capacity=100, session_ttl_seconds=1800, workspace_retention="per_node"):
         if not isinstance(role, str) or not role.strip():
             raise ValueError('必须提供业务角色提示词')
@@ -62,6 +66,8 @@ class Agent:
             raise ValueError('file_note_tools 必须为布尔值')
         if file_note_authorize is not None and not callable(file_note_authorize):
             raise TypeError('file_note_authorize 必须可调用或为 None')
+        if guidance_factory is not None and not callable(guidance_factory):
+            raise TypeError('guidance_factory 必须可调用或为 None')
         self.workspace_retention = workspace_retention
         self.models, self.storage, self.role = models, storage, role
         self.settings = settings or RuntimeSettings()
@@ -74,6 +80,7 @@ class Agent:
         self.reminder_tools = reminder_tools
         self.file_note_tools = file_note_tools
         self.file_note_authorize = file_note_authorize
+        self.guidance_factory = guidance_factory
         self._schedulers = {}
         self._running = set()
         self._closed = False
@@ -106,7 +113,8 @@ class Agent:
     async def run(self, question: str, *, owner: str, tree_id: str, task_id=None,
                   parent_id='latest', attachments=(), thinking_effort='none',
                   supplemental='', publish=None, _events=None, _preview=False, _dispatch=None,
-                  _repository=None, _control=None, _reminder_repository=None, _session_tools=(), _role=None, created_at=None):
+                  _repository=None, _control=None, _reminder_repository=None, _session_tools=(), _role=None,
+                  _guidance_factory=_UNSET, created_at=None):
         if self._closed:
             raise RuntimeError('Agent 已关闭')
         running = asyncio.current_task()
@@ -173,9 +181,13 @@ class Agent:
             entries.extend(custom)
             if self.tool_factory and not managed:
                 entries += list(self.tool_factory(ToolContext(repository, journal, memory)))
+            effective_guidance = self.guidance_factory if _guidance_factory is _UNSET else _guidance_factory
+            if effective_guidance is not None and not callable(effective_guidance):
+                raise TypeError('guidance_factory 必须可调用或为 None')
             core = AgentCore(self.settings, client=self.models.daily, counter=self.models.count_tokens,
                 options=self.options, registry=ToolRegistry(entries),
-                prompt_builder=partial(build_system_prompt, role=_role or self.role))
+                prompt_builder=partial(build_system_prompt, role=_role or self.role),
+                guidance_factory=effective_guidance)
             if use_memory:
                 memory_cache_pool = create_memory_cache_pool(
                     capacity=self.options.memory_cache_max_queries,

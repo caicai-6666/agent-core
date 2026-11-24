@@ -25,6 +25,7 @@ from .hooks import FeedbackOnlyHook
 from .progress import ToolProgress
 from .registry import RegisteredTool
 from .result import OrdinaryToolContent, ToolExecutionResult
+from .runtime_context import current_tool_runtime
 
 
 def render_file_search_feedback(arguments, execution, context):
@@ -71,16 +72,30 @@ def render_file_search_feedback(arguments, execution, context):
 def build_file_search_registration(
     *,
     backend: FileSearchBackend,
-    core,
-    journal,
-    thinking_effort: str = 'none',
+    core=None,
+    journal=None,
+    thinking_effort: str | None = None,
     cache_pool: CachePool[FileSearchResultSet] = DEFAULT_FILE_SEARCH_CACHE_POOL,
 ) -> RegisteredTool:
-    """构建通用文件检索工具；结果集写入共享 CachePool，随主循环提交原子生效。"""
+    """构建通用文件检索工具；结果集写入共享 CachePool，随主循环提交原子生效。
+
+    省略 core、journal 或 thinking_effort 时，在工具 execute 期间自动从
+    current_tool_runtime() 解析当前任务的宿主核心、日志和推理档位。
+    """
     if not isinstance(cache_pool, CachePool):
         raise TypeError('cache_pool 必须为 CachePool 实例')
 
     async def execute(args: SearchFilesArguments):
+        # 缺失运行依赖时按需从当前工具执行上下文补齐，兼容静态装配与显式注入两种方式。
+        runtime_ctx = (
+            current_tool_runtime()
+            if (core is None or journal is None or thinking_effort is None)
+            else None
+        )
+        active_core = core if core is not None else runtime_ctx.core
+        raw_journal = journal if journal is not None else runtime_ctx.journal
+        resolve_journal = raw_journal if callable(raw_journal) else (lambda: raw_journal)
+        active_effort = thinking_effort if thinking_effort is not None else runtime_ctx.thinking_effort
         candidates = None
         try:
             cache = current_tool_cache(cache_pool)
@@ -144,14 +159,14 @@ def build_file_search_registration(
 
             async with AsyncExitStack() as stack:
                 from agent_core.infrastructure.mllm import MLLMClient
-                client = core.client if core.client is not None else await stack.enter_async_context(MLLMClient(core.settings))
+                client = active_core.client if active_core.client is not None else await stack.enter_async_context(MLLMClient(active_core.settings))
 
                 async def generate(messages, tools, generation):
-                    return await core._invoke(client, journal(), messages, tools, generation, 'file_retrieval')
+                    return await active_core._invoke(client, resolve_journal(), messages, tools, generation, 'file_retrieval')
 
                 async def record_retrieval(event):
                     try:
-                        await journal().record_file_retrieval(event)
+                        await resolve_journal().record_file_retrieval(event)
                     except Exception as error:
                         raise AgentDependencyError('文件检索审计保存失败，已停止') from error
 
@@ -159,10 +174,10 @@ def build_file_search_registration(
                     pool=candidates,
                     search=search,
                     generate=generate,
-                    counter=core.counter,
-                    generation=core.generation(thinking_effort),
-                    context_window=core.settings.context_window_tokens,
-                    tool_template=core.tool_call_template,
+                    counter=active_core.counter,
+                    generation=active_core.generation(active_effort),
+                    context_window=active_core.settings.context_window_tokens,
+                    tool_template=active_core.tool_call_template,
                     max_rounds=settings.max_rounds,
                     audit=record_retrieval,
                 )

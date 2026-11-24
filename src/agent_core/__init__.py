@@ -1,4 +1,4 @@
-from .core import AgentCore, AgentCoreError, AgentInput, AgentResult, CoreSettings
+from .core import AgentCore, AgentCoreError, AgentInput, AgentResult, CoreSettings, ProgressGuidance, RequestGuidance
 from .agent import Agent, AgentEvent, FinishTask, ToolContext
 from .providers import Models, RuntimeSettings, ChatProvider, EmbeddingProvider, OpenAIEmbedding
 from .storage import Storage, StorageConflict
@@ -23,6 +23,8 @@ from .core.tool import (
     WriteOnlyCache,
     ReadWriteCache,
     current_tool_cache,
+    ToolRuntimeContext,
+    current_tool_runtime,
     ViewPDFArguments,
     build_pdf_view_registration,
     FileCandidateViewer,

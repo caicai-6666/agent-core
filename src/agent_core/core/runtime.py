@@ -23,6 +23,7 @@ from .tool.retry import ToolFailureTracker
 from .prompt import build_system_prompt,build_system_guidence_message
 from .tool import ToolRegistry,ToolHookContext
 from .tool.cache import CacheScope
+from .tool.runtime_context import ToolRuntimeContext, bind_tool_runtime
 from .context_rendering.page import render_tool_receipt
 from .page_display import PageDisplayWindow
 from .guidance import RequestGuidance
@@ -423,19 +424,21 @@ class AgentCore:
             if control:
                 control.before_tool(final=self.registry.entries[call.name].output_kind == 'final')
             try:
-                execution = await self.registry.execute(
-                    call.name,
-                    arguments,
-                    publish_progress=publish_progress,
-                    call_id=call.call_id,
-                    hook_context=ToolHookContext(
-                        record_generation=journal.record_payload,
-                        workspace_feedback=workspace_feedback,
-                        compacted_turns=summary_size if summary_result is not None else None,
-                    ),
-                    task_cache=task_cache,
-                    session_cache=session_cache,
-                )
+                # 在单次工具执行边界内绑定运行时上下文，供组合工具读取当前任务的 core/journal/thinking_effort。
+                with bind_tool_runtime(ToolRuntimeContext(core=self, journal=journal, thinking_effort=request.thinking_effort)):
+                    execution = await self.registry.execute(
+                        call.name,
+                        arguments,
+                        publish_progress=publish_progress,
+                        call_id=call.call_id,
+                        hook_context=ToolHookContext(
+                            record_generation=journal.record_payload,
+                            workspace_feedback=workspace_feedback,
+                            compacted_turns=summary_size if summary_result is not None else None,
+                        ),
+                        task_cache=task_cache,
+                        session_cache=session_cache,
+                    )
                 result=execution.result
                 if execution.output is not None:
                     # 钩子只替换输出正文，不修改已经执行的动作参数或工作区候选。

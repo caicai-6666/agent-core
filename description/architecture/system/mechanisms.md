@@ -14,7 +14,9 @@
 | 主题规划、并行主题摘要、来源校验与合并 | `core/subgraph/context_management/topic_summary/` | 原实现，审计串行保存 |
 | 工作区压缩、待提交编辑保护 | `core/subgraph/context_management/workspace_compression/` | 原实现，候选验证后再提交 |
 | 原生工具对、私有推理与纠错轨迹隔离 | `core/native_messages.py`、`core/runtime.py` | 原实现，成功后清除临时失败 |
+| 临时请求提示（开场提示与周期进展提醒） | `core/guidance.py`、`agent.py`、`sessions.py`、`runtime.py` | 仅附加到单次模型请求，不入历史或工作区；支持实例默认与单任务内存覆盖 |
 | Pydantic 参数、字段说明、工具独立顺序钩子 | `core/tool/registry.py`、`hooks.py` | 原实现；展示与结构化结果分离 |
+| 工具执行期运行时上下文（`ContextVar`） | `core/tool/runtime_context.py`、`core/runtime.py`、`core/tool/file_search.py` | 执行边界内向组合工具暴露只读 `core`/`journal`/`thinking_effort`，支持静态装配子循环工具 |
 | 工具结果对象缓存池、权限受限句柄与事务提交 | `core/tool/cache.py`、`registry.py` | 可选声明，按 `task`/`session` 作用域隔离 LRU，提交确认后落池 |
 | 事务前检查点、提交后回调、幂等任务 | `tasks.py`、`storage.py` | 库拥有状态机，底层数据库只提供 CAS |
 | 任务父链、分支、工作区版本、摘要重启恢复 | `tasks.py` | 库内统一，不委托给消费者重写 |
