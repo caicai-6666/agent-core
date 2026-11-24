@@ -56,13 +56,15 @@ await database.close()
 首次空闲扫描即可触发心跳。只有树没有在途任务、没有到期提醒、也没有已激活的等待任务，才领取已到间隔的心跳。即使业务任务的优先级为负数，它也先于心跳；心跳一旦开始，随后到达的业务任务按队列规则等待。
 
 - `priority` 是整数，数值越大越早被领取。
-- `await agent.generate("补充交付日期", priority=10, merge_with_previous=True)` 会追加到最近入队、同优先级、已就绪的普通等待任务。目标保留原任务 ID 和排队位置，两次提交共享执行结果；同一驻留实例也共享事件流。默认每次提交创建独立任务。没有符合条件的目标时按普通任务入队。
+- `parent_id` 默认为 `"latest"`（继承当前 `head`）；传入指定已提交节点的 32 位小写十六进制任务 ID 可在同树内持久化创建历史分支，传入 `None` 可在同树内创建新根节点。`workspace_retention="latest"` 下历史节点的工作区已释放，从非当前 `head` 分支会以 `StorageConflict` 结束该任务；指定不存在的 `parent_id` 会以 `KeyError` 结束该任务，均自动出队而不阻塞后续任务。`redirect`（即 `replace_task_id`）不能与非 `"latest"` 的 `parent_id` 同时使用。
+- `await agent.generate("补充交付日期", priority=10, merge_with_previous=True)` 会追加到最近入队、同优先级、同 `parent_id` 且已就绪的普通等待任务。目标保留原任务 ID 和排队位置，两次提交共享执行结果；同一驻留实例也共享事件流。默认每次提交创建独立任务。没有符合条件的目标时按普通任务入队。
 - 合并按入队事务提交顺序保留每段 prompt 和补充上下文，附件按文件 ID 去重。任务来源、创建时间和推理档位沿用目标任务；任何一次输入关闭预览时，该任务关闭预览。待激活输入和定向替代输入不能同时请求合并。在途任务、到期提醒和空闲心跳均不作为合并目标。
 - 合并和领取使用同一队列版本校验。目标被抢先领取时重新选择，合并收据与队列更新在同一事务提交。`external_id` 重投返回原任务 ID，每段输入只追加一次。
-- `external_id` 在本实例的任务作用域内去重；相同输入并发投递共用任务 ID，冲突输入报错。持久树的收据跨重启保留。使用 `latest` 时较早的任务仍有收据，完整结果回读遵循历史工作区保留策略。
+- `external_id` 在本实例的任务作用域内去重；相同输入并发投递共用任务 ID，冲突输入报错。仅当 `parent_id != "latest"` 时才将 `parent_id` 纳入指纹，默认请求的既有 `external_id` 指纹保持向后兼容。持久树的收据跨重启保留。使用 `latest` 时较早的任务仍有收据，完整结果回读遵循历史工作区保留策略。
 - `created_at` 可传业务事件的带时区时间，用作模型的任务时间。省略时取提交时间。
 - `deferred=True` 登记任务后等待显式激活；宿主可在首次订阅时调用 `await job.activate()`。重启后恢复实例并调用 `await agent.activate(task_id)` 可重新获得句柄。等待激活的任务不会阻塞其他已就绪任务。
 - `guidance_factory` 可在 `create`、`restore` 绑定会话默认临时请求提示策略（如 `ProgressGuidance.factory(interval_seconds=60.0)`），也可在 `generate(..., guidance_factory=...)` 按单任务覆盖或传 `None` 临时关闭。工厂为进程内 Python 回调，不写入持久队列 JSON；`ProgressGuidance.factory(...)` 支持按参数值比较相等，便于持久实例 `restore` 核对配置一致性，空闲驱逐后冷重绑自动保留原工厂。
+- `await agent.tree()` 与 `await runtime.tree(tree_id, database=None)` 返回只读 `TreeView`（含 `tree_id`、`head`、`active`、`workspace_retention` 及按创建顺序排列的全量 `TreeNode` 列表，覆盖主线与全部历史分支，不含工作区大对象与私有审计）。`runtime.tree(...)` 无需预先装配角色或工具即可打开整棵树渲染，找不到树时抛出 `KeyError`。
 - `agent.recover(task_id)` 用于宿主确认旧执行进程已经停止后的故障收束。任务不会重放。
 - 新接口使用数据库内固定的树命名空间。接续旧 `Agent` 创建的树时，用 `AgentRuntime(..., legacy_owner=原owner)` 绑定其原有命名空间；原数据库的执行模式与工作区策略继续有效。拥有同名树的多个旧 owner 应分别绑定。
 
@@ -264,6 +266,7 @@ async for event in replacement.events():
 - `mode="interruptible"` 同样对普通提交排队。`await session.stop(task_id)` 等待停止并返回终态；`replace_task_id` 在旧任务确认 `superseded` 后优先接续。迟到的指令被拒绝，已进入最终工具收尾时以该工具的实际结果为准。可从运行时任务的 `task.started` 事件或 `session.active_task_id` 获取当前执行标识。
 - 停止时取消主模型生成；已进入的工具继续至结果与检查点确认。工具执行结果不确定时，旧任务失败，依赖其成功替代的指令不会开始。已提交的外部写入保留。工具自行阻塞时，安全切换需要等待工具返回。
 - `await task.result()` 返回 `AgentResult`，已打断任务抛出带终态的 `TaskInterrupted`。`task.events()` 可订阅任一模式，断开订阅后执行继续。提交时传入 `preview=False` 可关闭候选正文预览，进度与已提交输出仍可观察。每个句柄保留最近 256 个事件，超窗时回查结果。旧的 `agent.stream()` 仍沿用断流取消契约。
+- `session.submit(..., parent_id=...)` 支持指定历史父节点或 `None` 新根；`await session.tree()` 返回当前会话对应任务树的全量只读 `TreeView`。
 - `session.scheduler(...).start()` 显式开启已有心跳或提醒调度。已到期提醒优先于等待中的普通业务输入，调度不抢占。冻结分身取得本体的调度器；内存会话的调度器随会话关闭。
 
 ### 驻留与部署

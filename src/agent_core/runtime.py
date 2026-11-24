@@ -58,11 +58,11 @@ class TreeAgent:
 
     async def generate(self, question, *, priority=0, merge_with_previous=False, external_id=None, created_at=None,
                        deferred=False, source='user', attachments=(), thinking_effort='none', supplemental='', preview=True,
-                       guidance_factory=_UNSET):
+                       guidance_factory=_UNSET, parent_id: str | None = 'latest'):
         session = await self._resident()
         return await session.submit(question,priority=priority,merge_with_previous=merge_with_previous,external_id=external_id,created_at=created_at,
             deferred=deferred,source=source,attachments=attachments,thinking_effort=thinking_effort,
-            supplemental=supplemental,preview=preview,guidance_factory=guidance_factory)
+            supplemental=supplemental,preview=preview,guidance_factory=guidance_factory,parent_id=parent_id)
 
     async def activate(self, task_id):
         return await (await self._resident()).activate(task_id)
@@ -82,6 +82,9 @@ class TreeAgent:
 
     async def snapshot(self, task_id=None):
         return await (await self._resident()).snapshot(task_id)
+
+    async def tree(self):
+        return await (await self._resident()).tree()
 
     async def scheduler(self, **options):
         return (await self._resident()).scheduler(**options)
@@ -173,6 +176,14 @@ class AgentRuntime:
             session = await engine.sessions._open(self._owner,new_tree_id(),'fork','queue' if execution_mode is None else execution_mode,
                 context,reminders=repo,tools=tools,role=role,guidance_factory=guidance_factory)
         return TreeAgent(self,session,tree_id)
+
+    async def tree(self, tree_id: str, *, database=None):
+        """只读获取数据库中整棵任务树的结构视图，无需预先装配角色或工具。"""
+        engine = self._engine_for(database)
+        _, state = await self._metadata(engine, tree_id)
+        repo = TaskRepository(engine.storage, owner=self._owner, tree_id=tree_id,
+                              workspace_retention=state.get('workspace_retention', 'per_node'))
+        return await repo.tree()
 
     async def close(self):
         self._closed = True

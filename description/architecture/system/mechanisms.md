@@ -19,7 +19,7 @@
 | 工具执行期运行时上下文（`ContextVar`） | `core/tool/runtime_context.py`、`core/runtime.py`、`core/tool/file_search.py` | 执行边界内向组合工具暴露只读 `core`/`journal`/`thinking_effort`，支持静态装配子循环工具 |
 | 工具结果对象缓存池、权限受限句柄与事务提交 | `core/tool/cache.py`、`registry.py` | 可选声明，按 `task`/`session` 作用域隔离 LRU，提交确认后落池 |
 | 事务前检查点、提交后回调、幂等任务 | `tasks.py`、`storage.py` | 库拥有状态机，底层数据库只提供 CAS |
-| 任务父链、分支、工作区版本、摘要重启恢复 | `tasks.py` | 库内统一，不委托给消费者重写 |
+| 任务父链、持久化分支、全量树视图、工作区版本、摘要重启恢复 | `tasks.py`、`sessions.py`、`runtime.py` | 支持 `parent_id` 历史分支/新根与 `TreeView`/`TreeNode` 只读全量视图，库内统一不委托消费者重写 |
 | 用户/树隔离、执行中断恢复 | `agent.py`、`tasks.py` | 绑定可信作用域，不自动重放外部副作用 |
 | 公开消息记忆、统一向量、混合召回和来源复核 | `memory.py`、`vectors.py` | 数据库可替换，来源语义固定 |
 | 检索子 Agent、LRU 分页、签名资料、页面折叠与 `CachePool` 集成 | `core/subgraph/memory_retrieval/`、`core/tool/memory_search.py`、`core/tool/memory_viewer.py`、`core/page_display.py` | 共享 `scope='task'` `CachePool` 存放结果集，正文持续回查权威父链 |

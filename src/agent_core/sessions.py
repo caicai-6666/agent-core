@@ -207,7 +207,8 @@ class Session:
             for index in reversed(range(len(items))):
                 target = items[index]
                 if (target['priority'] != item['priority'] or target.get('deferred')
-                        or target.get('replace') is not None or target['source'] not in ('user', 'business')):
+                        or target.get('replace') is not None or target['source'] not in ('user', 'business')
+                        or target.get('parent_id', 'latest') != item.get('parent_id', 'latest')):
                     continue
                 attachments = {ref['file_id']: ref for ref in target['attachments']}
                 for ref in item['attachments']:
@@ -223,7 +224,7 @@ class Session:
 
     async def submit(self, question, *, priority=0, merge_with_previous=False, source='user', attachments=(), thinking_effort='none',
                      supplemental='', replace_task_id=None, preview=True, external_id=None, created_at=None, deferred=False,
-                     guidance_factory=_UNSET):
+                     guidance_factory=_UNSET, parent_id: str | None = 'latest'):
         if type(priority) is not int or source not in ('user', 'business') or not isinstance(supplemental, str):
             raise ValueError('需要整数优先级、有效输入来源和文本上下文')
         if type(preview) is not bool:
@@ -236,6 +237,11 @@ class Session:
             raise ValueError('merge_with_previous 必须为布尔值')
         if merge_with_previous and (deferred or replace_task_id is not None):
             raise ValueError('只有就绪的普通输入可以请求合并')
+        if parent_id not in ('latest', None):
+            if not isinstance(parent_id, str) or len(parent_id) != 32 or any(c not in '0123456789abcdef' for c in parent_id):
+                raise ValueError('parent_id 必须为 latest、None 或 32 位小写十六进制任务 ID')
+        if replace_task_id is not None and parent_id != 'latest':
+            raise ValueError('定向替代任务不能同时指定历史 parent_id')
         if guidance_factory is not _UNSET and guidance_factory is not None and not callable(guidance_factory):
             raise TypeError('guidance_factory 必须可调用或为 None')
         request = AgentInput(question=question, attachments=list(attachments), source=source, thinking_effort=thinking_effort,
@@ -243,7 +249,8 @@ class Session:
         ticket = SessionTask(new_tree_id())
         item = {'id': ticket.id, 'question': question, 'priority': priority, 'source': source,
                 'replace': replace_task_id, 'attachments': [a.model_dump(mode='json') for a in request.attachments],
-                'thinking_effort': thinking_effort, 'supplemental': supplemental, 'preview': preview}
+                'thinking_effort': thinking_effort, 'supplemental': supplemental, 'preview': preview,
+                'parent_id': parent_id}
         item['created_at'] = request.created_at.isoformat()
         item['deferred'] = deferred
         receipt_key = None
@@ -252,6 +259,8 @@ class Session:
             fingerprint = {**item,'created_at':item['created_at'] if created_at is not None else None}
             fingerprint.pop('id')
             # 默认请求保持旧版指纹，历史 external_id 可继续重投。
+            if parent_id == 'latest':
+                fingerprint.pop('parent_id', None)
             if merge_with_previous:
                 fingerprint['merge_with_previous'] = True
             fingerprint = hashlib.sha256(json.dumps(fingerprint,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
@@ -411,7 +420,14 @@ class Session:
                 rejected = await self.repository.storage.read(self.repository.scope, 'runtime_rejected:' + identifier)
                 if rejected is None:
                     raise
-                await ticket.finish('failed', error=StorageConflict('原任务未被替代，未执行新指令'))
+                reason = rejected.value
+                if reason.get('error_type') == 'KeyError':
+                    err = KeyError(reason.get('message', '当前用户任务树中不存在该任务'))
+                elif reason.get('message'):
+                    err = StorageConflict(reason['message'])
+                else:
+                    err = StorageConflict('原任务未被替代，未执行新指令')
+                await ticket.finish('failed', error=err)
                 self._tickets.pop(identifier)
                 self._task_guidance.pop(identifier, None)
                 continue
@@ -453,6 +469,37 @@ class Session:
                         attachments=[],thinking_effort='none',supplemental='',created_at=first.get('scheduled_for'))
         return reminder, (Write('runtime_queue',queue.version,queue.value),
                           Write('reminder_queue',due.version,{'items':remaining}))
+
+    async def _is_dispatch_contention(self, dispatch):
+        # 仅当树版本、在途标记或队列版本已变化时视为并发竞争，允许重新选队。
+        tree = await self.repository.storage.read(self.repository.scope, 'tree')
+        if (tree.version if tree else None) != dispatch.tree_version:
+            return True
+        if tree and tree.value.get('active') is not None:
+            return True
+        for write in dispatch.writes:
+            if write.key in ('runtime_queue', 'reminder_queue'):
+                current = await self.repository.storage.read(self.repository.scope, write.key)
+                if (current.version if current else None) != write.expected:
+                    return True
+        return False
+
+    async def _reject_queued(self, item_id, reason):
+        # 永久性启动失败（如父节点不存在或历史工作区已释放）须从队列移除并写拒绝标记，避免死循环重试。
+        while True:
+            record = await self._queue()
+            items = record.value['items'] if record else []
+            rest = [entry for entry in items if entry['id'] != item_id]
+            if len(rest) == len(items):
+                return False
+            try:
+                await self.repository.storage.atomic(self.repository.scope, [
+                    Write('runtime_queue', record.version, {'items': rest}),
+                    Write('runtime_rejected:' + item_id, None, reason),
+                ])
+                return True
+            except StorageConflict:
+                continue
 
     async def _drain(self):
         repo = self.repository
@@ -508,19 +555,30 @@ class Session:
                         else (self.guidance_factory if self.guidance_factory is not None else _UNSET)
                     )
                     result = await self.runtime.agent.run(item['question'], owner=self.owner, tree_id=self.id,
-                        task_id=ticket.id, attachments=item['attachments'], thinking_effort=item['thinking_effort'],
+                        task_id=ticket.id, parent_id=item.get('parent_id', 'latest'),
+                        attachments=item['attachments'], thinking_effort=item['thinking_effort'],
                         supplemental=item['supplemental'], _events=None if scheduled else ticket.emit,
                         publish=scheduler.publish if scheduled and scheduler else None, _preview=item.get('preview', True),
                         _repository=repo, _reminder_repository=self._reminder_repository, _session_tools=self.tools,
                         _control=self._active.control, _dispatch=dispatch, _role=self.role, created_at=item.get('created_at'),
                         **({'_guidance_factory': effective_guidance} if effective_guidance is not _UNSET else {}))
                 except StorageConflict as error:
-                    # 入队/领取竞争只在请求仍留队时重选；已开始的工具绝不重放。
+                    # 入队/领取竞争只在请求仍留队且确有版本竞争时重选；非竞争冲突（如历史工作区已释放）直接出队失败。
                     if not self._active.control.started:
-                        # 提醒仍在自己的队列中，内部占位句柄不作为普通任务继续观察。
                         if scheduled:
-                            self._tickets.pop(ticket.id,None)
-                        continue
+                            self._tickets.pop(ticket.id, None)
+                            continue
+                        if await self._is_dispatch_contention(dispatch):
+                            continue
+                        await self._reject_queued(ticket.id, {'error_type': 'StorageConflict', 'message': str(error)})
+                    await ticket.finish('failed', error=error)
+                except KeyError as error:
+                    # 指定的历史 parent_id 不存在时直接出队并结束该任务，不中断后续队列消费。
+                    if not self._active.control.started:
+                        if scheduled:
+                            self._tickets.pop(ticket.id, None)
+                            continue
+                        await self._reject_queued(ticket.id, {'error_type': 'KeyError', 'message': error.args[0] if error.args else str(error)})
                     await ticket.finish('failed', error=error)
                 except asyncio.CancelledError:
                     task, _ = await repo.load(ticket.id)
@@ -557,6 +615,16 @@ class Session:
             tree = await self.repository.storage.read(self.repository.scope, 'tree')
             parent = task_id if task_id is not None else (tree.value['head'] if tree else None)
             return await self.repository.context(parent)
+        finally:
+            self._pins -= 1
+            self.touched = monotonic()
+
+    async def tree(self):
+        await self.runtime.evict_idle()
+        self._touch()
+        self._pins += 1
+        try:
+            return await self.repository.tree()
         finally:
             self._pins -= 1
             self.touched = monotonic()

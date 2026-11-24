@@ -39,6 +39,34 @@ class Task(BaseModel):
         return AgentResult.model_validate(self.result)
 
 
+class TreeNode(BaseModel):
+    """任务树全量视图中的只读节点摘要；不包含工作区大对象与私有审计。"""
+    model_config = ConfigDict(frozen=True)
+    id: str
+    parent_id: str | None
+    source: str
+    status: str
+    question: str
+    attachments: list[dict] = Field(default_factory=list)
+    created_at: AwareDatetime
+    outputs: list[tuple[str, str]] = Field(default_factory=list)
+    output_ids: list[str] = Field(default_factory=list)
+    summary: str = ''
+    covered_turns: int = 0
+    rounds: int = 0
+    answer: str | None = None
+
+
+class TreeView(BaseModel):
+    """整棵任务树（主线与全部历史分支）的只读结构视图。"""
+    model_config = ConfigDict(frozen=True)
+    tree_id: str
+    head: str | None
+    active: str | None
+    workspace_retention: str
+    nodes: list[TreeNode] = Field(default_factory=list)
+
+
 class TaskRepository:
     def __init__(self, storage: Storage, *, owner: str, tree_id: str, workspace_retention="per_node"):
         if not owner.strip() or not tree_id.strip():
@@ -123,6 +151,55 @@ class TaskRepository:
 
     async def context(self, parent_id):
         return self.extend_context(ContextInjection(), await self.path(parent_id))
+
+    async def tree(self) -> TreeView:
+        """读取整棵任务树（按创建顺序包含主线与全部历史分支），跳过已裁剪任务。"""
+        record = await self.storage.read(self.scope, 'tree')
+        if record is None:
+            return TreeView(tree_id=self.tree_id, head=None, active=None,
+                            workspace_retention=self.workspace_retention, nodes=[])
+        state = self._tree_state(record)
+        nodes: list[TreeNode] = []
+        for task_id in state['tasks']:
+            task_record = await self.storage.read(self.scope, 'task:' + task_id)
+            if task_record is None:
+                # 静默裁剪后的任务记录已删除，视图跳过不存在的槽位。
+                continue
+            task = Task.model_validate(task_record.value)
+            summary = ''
+            covered_turns = 0
+            for item in task.exchanges:
+                if item.get('kind') == 'context_summary':
+                    summary = item.get('text', '')
+                    count = item.get('covered_turns', 0)
+                    if type(count) is int and count > 0:
+                        covered_turns += count
+            if isinstance(task.result, dict) and 'answer' in task.result:
+                answer = task.result['answer']
+            else:
+                answer = next((text for kind, text in reversed(task.outputs) if kind == 'final'), None)
+            nodes.append(TreeNode(
+                id=task.id,
+                parent_id=task.parent_id,
+                source=task.source,
+                status=task.status,
+                question=task.question,
+                attachments=task.attachments,
+                created_at=task.created_at,
+                outputs=task.outputs,
+                output_ids=task.output_ids,
+                summary=summary,
+                covered_turns=covered_turns,
+                rounds=task.rounds,
+                answer=answer,
+            ))
+        return TreeView(
+            tree_id=self.tree_id,
+            head=state['head'],
+            active=state['active'],
+            workspace_retention=state.get('workspace_retention', self.workspace_retention),
+            nodes=nodes,
+        )
 
     async def begin(self, request: AgentInput, *, task_id=None, parent_id='latest', dispatch=None):
         task_id = task_id or new_tree_id()

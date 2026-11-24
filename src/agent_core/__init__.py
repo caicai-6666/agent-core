@@ -15,6 +15,7 @@ from .scheduler import SchedulerSettings
 
 from .sessions import SessionRuntime, Session, SessionTask, SessionExpired, TaskInterrupted
 from .runtime import AgentRuntime, TreeAgent
+from .tasks import TreeNode, TreeView
 
 from .core.tool import (
     BaseTool,
