@@ -14,9 +14,9 @@ from .tools import build_progress_tool
 from .scheduler import SchedulerSettings
 from .heartbeat import HeartbeatFinishArguments, ScheduledFinishArguments, supports_heartbeat_pruning
 
-from .sessions import SessionRuntime, Session, SessionTask, SessionExpired, TaskInterrupted
+from .sessions import SessionRuntime, Session, SessionTask, SessionExpired, TaskInterrupted, ReplayUnavailableError
 from .runtime import AgentRuntime, TreeAgent
-from .tasks import TreeNode, TreeView
+from .tasks import DisplayEvent, StreamingMessage, TaskDisplay, TreeNode, TreeView
 
 from .core.tool import (
     BaseTool,

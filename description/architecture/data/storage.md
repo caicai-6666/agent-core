@@ -53,7 +53,8 @@ SQLite 另有 `memory_fts` 支撑记忆 BM25 检索、`file_notes_fts` 支撑文
 | 键 | 内容与生命周期 |
 | --- | --- |
 | `tree` | 当前 head、唯一 active 任务、任务 ID 列表及工作区保留策略 |
-| `task:<id>` | 父任务、用户原文、附件、终态、按策略保存的工作区、完整已接受轨迹、公开输出、结构化结果 |
+| `task:<id>` | 父任务、用户原文、附件、计时字段（`started_at`、`finished_at`、`duration_ms`）、`advance_head` 标记、终态、按策略保存的工作区、完整已接受轨迹、公开输出、结构化结果（旧记录缺省按兼容默认值反序列化） |
+| `display:<task-id>` | 面向前端展示的公开事件日志（`events`、`streaming_messages`、`last_sequence`）；仅在非 delta 公开事件（`task.started`、`progress`、`message.completed`、`memory.deferred`、终态 `task.<status>`）时 CAS 持久化，严禁写入私有 `exchanges`、`audit`、工作区大对象或内部 `tool_result` |
 | `generation:<id>` | 私有原始模型响应、分片、用途及失败；不进入普通历史/记忆检索 |
 | `checkpoint:<id>` | 不可变提交状态、逐节点模式下的工作区引用、轨迹长度、公开消息 ID 与结构化结果 |
 | `workspace:<hash>` | 逐节点模式按内容去重的不可变工作区版本 |
@@ -61,7 +62,7 @@ SQLite 另有 `memory_fts` 支撑记忆 BM25 检索、`file_notes_fts` 支撑文
 | `audit:<task-id>` | 运行纠错、清理、延期等私有事件 |
 | `embedding:<task-id>:<space-hash>` | 成功索引来源指纹；缺失或变化时可从权威任务重建 |
 
-同一树同时只运行一个任务；可以有多个根和分支，显式 parent 决定上下文。不同树/用户可并发。任务开始时原子占用树；终态与释放 active 同批提交。重命名等业务元数据应独立于该执行版本。`TaskRepository.tree()` 按 `tree['tasks']` 顺序返回只读 `TreeView`（节点类型为 `TreeNode`，含 `parent_id`、`outputs`、`output_ids`、摘要窗口、轮数与最终答复），跳过已静默裁剪且记录不存在的槽位，不加载工作区大对象与私有审计。
+同一树同时只运行一个任务；可以有多个根和分支，显式 parent 决定上下文。不同树/用户可并发。任务开始时原子占用树并记录 UTC `started_at`；进程内终态写入使用单调时钟计算的 `duration_ms` 与 UTC `finished_at`，并与释放 `active` 同批提交（仅当 `advance_head=True` 时推进 `tree['head']`，`workspace_retention="latest"` 下禁止 `advance_head=False`）。重命名等业务元数据应独立于该执行版本。`TaskRepository.tree(include_display=True, live_displays=None)` 按 `tree['tasks']` 顺序返回只读 `TreeView`（节点类型为 `TreeNode`，含 `parent_id`、`started_at`、`finished_at`、`duration_ms`、`outputs`、`output_ids`、摘要窗口、轮数、最终答复及可选 `display: TaskDisplay | None`），跳过已静默裁剪且记录不存在的槽位，不加载工作区大对象与私有审计。`message.delta` 仅更新进程内 `DisplayRecorder` 缓存而不逐片写库，在途刷新由 `live_displays` 叠加最新 `streaming_messages` 与 `last_sequence`；跨进程崩溃 `recover()` 在收束任务终态时按 `finished_at - started_at` 回填 `duration_ms`，若存在 `display:<task-id>` 则同事务将残留 `streaming_messages` 收束为 `status="interrupted"` 的 `message.completed` 并追加终态事件。
 
 MySQL 可使用事务和锁定行实现 CAS；SQLite 参考实现使用 `BEGIN IMMEDIATE`。Elasticsearch 单文档 CAS 不自动满足跨文档原子性：需要按 scope 设计单个权威聚合文档，或组合事务型权威存储与 ES 检索，不能直接逐条 update 冒充本契约。
 
@@ -126,12 +127,12 @@ SQLite 用 FTS5 BM25 和精确余弦排序，中文逐字加二元组切分；�
 
 存储适配器提供 `supports_atomic_delete=True` 表示支持 `Write(key, expected_version, None)` 同事务按版本删除。启用该声明前须验证删除与其他写入可整体回滚；SQLite 已实现。旧适配器可正常运行心跳，模型请求裁剪时会得到保留记录的反馈。
 
-裁剪提交会复核可信任务来源、首轮主生成、唯一结束调用、静默交付、工作区和树版本。事务删除本次任务、生成、初始检查点及该检查点新增的工作区快照，保留共享快照及原父链，并写入最小 `pruned:<task-id>` 完成账本防止重放。裁剪发生在外发和记忆索引之前；任何版本冲突都会整体回滚。
+裁剪提交会复核可信任务来源、首轮主生成、唯一结束调用、静默交付、工作区和树版本。事务删除本次任务、展示日志（`display:<task-id>`，存在时一并删除）、生成、初始检查点及该检查点新增的工作区快照，保留共享快照及原父链，并写入最小 `pruned:<task-id>` 完成账本防止重放。裁剪发生在外发和记忆索引之前；任何版本冲突都会整体回滚。
 
 ---
 
 ## 会话队列与冻结分身
 
-`runtime_session` 保存该任务树的执行模式。`runtime_queue` 保存等待项的任务 ID、原始请求、业务来源、优先级、可选的替代目标及可选的 `parent_id`（缺省按 `"latest"` 处理以兼容历史队列）。成功领取时，出队、树占用和创建任务同事务提交。替代目标未以 superseded 结束或已非最新节点，以及指定的 `parent_id` 不存在或在 `latest` 策略下历史工作区已释放时，原子出队并保存 `runtime_rejected:<id>`，不创建虚假执行，也不反复重试阻塞队列。普通业务注入使用 business 来源，在当前及历史上下文中展示为业务系统任务，不作为用户口述内容进入记忆索引。
+`runtime_session` 保存该任务树的执行模式。`runtime_queue` 保存等待项的任务 ID、原始请求、业务来源、优先级、可选的替代目标、可选的 `parent_id`（缺省按 `"latest"` 处理以兼容历史队列）、可选的 `advance_head`（缺省按 `True` 处理；定向替代未显式指定时继承被替代任务的策略）及可选的 `deferred` 标记（允许与 `replace_task_id` 组合，先立即中断旧任务再等待显式激活）。成功领取时，出队、树占用和创建任务同事务提交。替代目标未以 superseded 结束或不符合续接条件（`advance_head=True` 须为当前 `head`，`advance_head=False` 须仍在树中），以及指定的 `parent_id` 不存在或在 `latest` 策略下历史工作区已释放时，原子出队并保存 `runtime_rejected:<id>`，不创建虚假执行，也不反复重试阻塞队列。普通业务注入使用 business 来源，在当前及历史上下文中展示为业务系统任务，不作为用户口述内容进入记忆索引。
 
 冻结分身的基础快照与本体隔离，冷恢复或热复用均以已提交终态节点为准；分身结束后的工作区、轨迹及向量保存在独享内存库。本体的提醒写入使用本体作用域的版本校验。宿主自定义工具的数据库连接及副作用归宿主所有。

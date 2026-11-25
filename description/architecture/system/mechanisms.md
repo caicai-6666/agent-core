@@ -19,14 +19,14 @@
 | 工具执行期运行时上下文（`ContextVar`） | `core/tool/runtime_context.py`、`core/runtime.py`、`core/tool/file_search.py` | 执行边界内向组合工具暴露只读 `core`/`journal`/`thinking_effort`，支持静态装配子循环工具 |
 | 工具结果对象缓存池、权限受限句柄与事务提交 | `core/tool/cache.py`、`registry.py` | 可选声明，按 `task`/`session` 作用域隔离 LRU，提交确认后落池 |
 | 事务前检查点、提交后回调、幂等任务 | `tasks.py`、`storage.py` | 库拥有状态机，底层数据库只提供 CAS |
-| 任务父链、持久化分支、全量树视图、工作区版本、摘要重启恢复 | `tasks.py`、`sessions.py`、`runtime.py` | 支持 `parent_id` 历史分支/新根与 `TreeView`/`TreeNode` 只读全量视图，库内统一不委托消费者重写 |
+| 任务父链、持久化分支、全量树视图、工作区版本、节点计时与摘要重启恢复 | `tasks.py`、`sessions.py`、`runtime.py` | 支持 `parent_id` 历史分支/新根、`advance_head=False` 旁路探索、节点单调计时（`started_at`/`finished_at`/`duration_ms`）、`redirect(..., deferred=True)` 与 `TreeView`/`TreeNode` 只读全量视图，库内统一不委托消费者重写 |
 | 用户/树隔离、执行中断恢复 | `agent.py`、`tasks.py` | 绑定可信作用域，不自动重放外部副作用 |
 | 公开消息记忆、统一向量、混合召回和来源复核 | `memory.py`、`vectors.py` | 数据库可替换，来源语义固定 |
 | 检索子 Agent、LRU 分页、签名资料、页面折叠与 `CachePool` 集成 | `core/subgraph/memory_retrieval/`、`core/tool/memory_search.py`、`core/tool/memory_viewer.py`、`core/page_display.py` | 共享 `scope='task'` `CachePool` 存放结果集，正文持续回查权威父链 |
 | 通用 PDF 逐页查看、视觉预算与 `CachePool` 集成 | `core/file/pdf.py`、`core/file/pdf_viewer.py`、`core/tool/pdf_viewer.py` | 按需安装 `agent-core[pdf]`，任意 `file_id`、授权复核与自动关闭驱逐 |
 | 通用文件检索子 Agent、候选分页查看与 `CachePool` 集成 | `core/subgraph/file_retrieval/`、`core/tool/file_search.py`、`core/tool/file_candidates.py` | 解耦为 `FileSearchBackend` 协议，共享 `CachePool` 存放结果集 |
 | 文件备忘持久化、检索二次缩窄与可折叠分页查看 | `file_notes.py`、`core/tool/file_notes.py`、`adapters/sqlite.py`、`adapters/mysql.py` | 按 `scope` 隔离增删查（不覆盖写入），检索与分页共享 `scope='task'` `CachePool` 与签名资料页 |
-| SSE 候选预览、提交确认、中断 | `output_stream.py`、`agent.py` | 保留增量 JSON/Unicode 解码；与普通调用同一 Runtime |
+| SSE 候选预览、单调序号续传、持久化公开展示与无竞态终态 | `output_stream.py`、`tasks.py`、`agent.py`、`sessions.py`、`runtime.py` | 保留增量 JSON/Unicode 解码；统一单调 `sequence` 与 SSE `id:` 帧、支持 `after_sequence` 断点续传与 `ReplayUnavailableError`；`DisplayRecorder` 持久化非 delta 公开事件到 `display:<task_id>` 并在途叠加实时 `streaming_messages`，终态先落库再推流 |
 | 供应商替换、vLLM 默认可用适配 | `providers.py`、`infrastructure/` | 日常与 Embedding 分别注入 |
 | wheel、包内模板、独立安装 | `pyproject.toml`、`assets/tool-tag/` | 无 `app.*` 或后端绝对路径依赖 |
 

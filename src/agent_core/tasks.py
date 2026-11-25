@@ -3,6 +3,7 @@ import hashlib
 import json
 from copy import deepcopy
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from .core import AgentInput, AgentResult
@@ -14,6 +15,42 @@ from .model.question_tree import new_tree_id
 from .storage import Storage, Write, StorageConflict
 
 
+class DisplayEvent(BaseModel):
+    """公开展示日志中的单条事件；不包含私有推理、审计或内部工具回执。"""
+    model_config = ConfigDict(frozen=True)
+    sequence: int
+    type: str
+    data: dict
+
+
+class StreamingMessage(BaseModel):
+    """正在流式生成中的公开正文累积前缀。"""
+    model_config = ConfigDict(frozen=True)
+    message_id: str
+    message_kind: str
+    text: str
+
+
+class TaskDisplay(BaseModel):
+    """单任务的公开展示日志与实时流式前缀快照。"""
+    model_config = ConfigDict(frozen=True)
+    events: list[DisplayEvent] = Field(default_factory=list)
+    streaming_messages: list[StreamingMessage] = Field(default_factory=list)
+    last_sequence: int = 0
+
+
+def _completed_display_data(result: AgentResult) -> dict:
+    """提取可公开持久化的终态摘要，避免把大工作区或私有审计写入展示日志。"""
+    data = {
+        'answer': result.answer,
+        'intermediate': list(result.intermediate),
+        'rounds': result.rounds,
+    }
+    if result.delivery_error_type is not None:
+        data['delivery_error_type'] = result.delivery_error_type
+    return data
+
+
 class Task(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str
@@ -21,6 +58,10 @@ class Task(BaseModel):
     source: Literal['user', 'business', 'heartbeat', 'reminder'] = 'user'
     question: str
     created_at: AwareDatetime
+    started_at: AwareDatetime | None = None
+    finished_at: AwareDatetime | None = None
+    duration_ms: int | None = None
+    advance_head: bool = True
     attachments: list[dict] = Field(default_factory=list)
     status: Literal['generating','complete','failed','cancelled','superseded'] = 'generating'
     workspace: dict | None = Field(default_factory=lambda: empty_workspace().model_dump(mode='json'))
@@ -49,12 +90,16 @@ class TreeNode(BaseModel):
     question: str
     attachments: list[dict] = Field(default_factory=list)
     created_at: AwareDatetime
+    started_at: AwareDatetime | None = None
+    finished_at: AwareDatetime | None = None
+    duration_ms: int | None = None
     outputs: list[tuple[str, str]] = Field(default_factory=list)
     output_ids: list[str] = Field(default_factory=list)
     summary: str = ''
     covered_turns: int = 0
     rounds: int = 0
     answer: str | None = None
+    display: TaskDisplay | None = None
 
 
 class TreeView(BaseModel):
@@ -152,8 +197,10 @@ class TaskRepository:
     async def context(self, parent_id):
         return self.extend_context(ContextInjection(), await self.path(parent_id))
 
-    async def tree(self) -> TreeView:
+    async def tree(self, include_display: bool = True, live_displays: dict[str, TaskDisplay] | None = None) -> TreeView:
         """读取整棵任务树（按创建顺序包含主线与全部历史分支），跳过已裁剪任务。"""
+        if type(include_display) is not bool:
+            raise ValueError('include_display 必须为布尔值')
         record = await self.storage.read(self.scope, 'tree')
         if record is None:
             return TreeView(tree_id=self.tree_id, head=None, active=None,
@@ -178,6 +225,14 @@ class TaskRepository:
                 answer = task.result['answer']
             else:
                 answer = next((text for kind, text in reversed(task.outputs) if kind == 'final'), None)
+            display = None
+            if include_display:
+                if live_displays and task.id in live_displays:
+                    display = live_displays[task.id]
+                else:
+                    display_rec = await self.storage.read(self.scope, 'display:' + task.id)
+                    if display_rec is not None:
+                        display = TaskDisplay.model_validate(display_rec.value)
             nodes.append(TreeNode(
                 id=task.id,
                 parent_id=task.parent_id,
@@ -186,12 +241,16 @@ class TaskRepository:
                 question=task.question,
                 attachments=task.attachments,
                 created_at=task.created_at,
+                started_at=task.started_at,
+                finished_at=task.finished_at,
+                duration_ms=task.duration_ms,
                 outputs=task.outputs,
                 output_ids=task.output_ids,
                 summary=summary,
                 covered_turns=covered_turns,
                 rounds=task.rounds,
                 answer=answer,
+                display=display,
             ))
         return TreeView(
             tree_id=self.tree_id,
@@ -201,7 +260,12 @@ class TaskRepository:
             nodes=nodes,
         )
 
-    async def begin(self, request: AgentInput, *, task_id=None, parent_id='latest', dispatch=None):
+    async def begin(self, request: AgentInput, *, task_id=None, parent_id='latest', dispatch=None,
+                    advance_head: bool = True):
+        if type(advance_head) is not bool:
+            raise ValueError('advance_head 必须为布尔值')
+        if not advance_head and self.workspace_retention == 'latest':
+            raise StorageConflict('workspace_retention=latest 模式下不允许 advance_head=False')
         task_id = task_id or new_tree_id()
         if len(task_id) != 32 or any(c not in '0123456789abcdef' for c in task_id):
             raise ValueError('任务 ID 必须为 32 位小写十六进制 UUID')
@@ -213,7 +277,8 @@ class TaskRepository:
         if existing:
             task = Task.model_validate(existing.value)
             if (task.source != request.source or task.question != request.question or task.attachments != [a.model_dump() for a in request.attachments]
-                    or (parent_id != 'latest' and task.parent_id != parent_id)):
+                    or (parent_id != 'latest' and task.parent_id != parent_id)
+                    or task.advance_head != advance_head):
                 raise StorageConflict('任务 ID 已用于其他输入')
             await self._restore_workspace(task)
             return task, existing.version, False
@@ -224,7 +289,9 @@ class TaskRepository:
         parent_id = state['head'] if parent_id == 'latest' else parent_id
         context = await self.context(parent_id)
         task = Task(id=task_id, source=request.source, parent_id=parent_id, question=request.question,
-            created_at=request.created_at, attachments=[a.model_dump() for a in request.attachments],
+            created_at=request.created_at, started_at=datetime.now(timezone.utc),
+            advance_head=advance_head,
+            attachments=[a.model_dump() for a in request.attachments],
             workspace=context.workspace.model_dump(mode='json'))
         state['active'] = task.id
         state['tasks'].append(task.id)
@@ -248,7 +315,9 @@ class TaskRepository:
                     writes.append(Write('workspace:latest', latest.version if latest else None,
                                         {'task_id': task.id, 'workspace': task.workspace}))
             if state['active'] == task.id:
-                state = {**state, 'active': None, 'head': task.id}
+                # advance_head=False 时仅释放执行权，保留原有主线 head 不变。
+                new_head = task.id if task.advance_head else state['head']
+                state = {**state, 'active': None, 'head': new_head}
                 writes.append(Write('tree', tree.version, state))
         writes.append(Write('task:' + task.id, version, data))
         await self.storage.atomic(self.scope, writes)
@@ -278,9 +347,160 @@ class TaskRepository:
             raise ValueError("恢复终态仅允许失败、取消或用户调整方向")
         task, version = await self.load(task_id)
         if task.status == 'generating':
+            now = datetime.now(timezone.utc)
             task.status = status
-            await self.save(task, version)
+            task.finished_at = now
+            if task.started_at is not None:
+                task.duration_ms = max(0, int((now - task.started_at).total_seconds() * 1000))
+            extra = []
+            display_key = 'display:' + task.id
+            display_rec = await self.storage.read(self.scope, display_key)
+            if display_rec is not None:
+                # 崩溃恢复时一并收束残留流式消息并追加终态展示事件，与任务终态同事务落库。
+                display = TaskDisplay.model_validate(display_rec.value)
+                events = list(display.events)
+                seq = display.last_sequence
+                for msg in display.streaming_messages:
+                    seq += 1
+                    events.append(DisplayEvent(
+                        sequence=seq,
+                        type='message.completed',
+                        data={
+                            'message_id': msg.message_id,
+                            'message_kind': msg.message_kind,
+                            'text': msg.text,
+                            'status': 'interrupted',
+                            'task_id': task.id,
+                        },
+                    ))
+                seq += 1
+                events.append(DisplayEvent(
+                    sequence=seq,
+                    type='task.' + status,
+                    data={'task_id': task.id},
+                ))
+                final_display = TaskDisplay(events=events, streaming_messages=[], last_sequence=seq)
+                extra.append(Write(display_key, display_rec.version, final_display.model_dump(mode='json')))
+            await self.save(task, version, extra=extra)
         return task
+
+
+class DisplayRecorder:
+    """单任务的公开展示日志记录器与统一 SSE 序号源。
+
+    - message.delta 仅推进内存序号并累积 streaming_messages，不落库（避免分片写放大）；
+    - 非 delta 公开事件先 CAS 持久化到 display:<task_id>，再推送给 SSE 订阅者；
+    - 严禁记录私有 exchanges、audit 或内部 tool_result。
+    """
+
+    def __init__(self, repository: TaskRepository, task_id: str, *, sink=None):
+        self.repository = repository
+        self.task_id = task_id
+        self._sink = sink
+        self._events: list[DisplayEvent] = []
+        self._streaming: dict[str, dict] = {}
+        self._sequence: int = 0
+        self._version: int | None = None
+        self._terminal: bool = False
+        self.pruned: bool = False
+
+    def snapshot(self) -> TaskDisplay:
+        """返回当前进程内只读快照，供在途 tree() 合并实时流式前缀与最新序号。"""
+        return TaskDisplay(
+            events=list(self._events),
+            streaming_messages=[StreamingMessage(**item) for item in self._streaming.values()],
+            last_sequence=self._sequence,
+        )
+
+    def _payload(self, data: dict) -> dict:
+        return {**data, 'task_id': self.task_id}
+
+    async def _persist(self) -> None:
+        key = 'display:' + self.task_id
+        body = self.snapshot().model_dump(mode='json')
+        while True:
+            try:
+                await self.repository.storage.atomic(
+                    self.repository.scope,
+                    [Write(key, self._version, body)],
+                )
+                self._version = 1 if self._version is None else self._version + 1
+                return
+            except StorageConflict:
+                existing = await self.repository.storage.read(self.repository.scope, key)
+                self._version = existing.version if existing is not None else None
+
+    async def record(self, kind: str, data: dict):
+        """记录公开事件：delta 仅写内存；非 delta 先落库再推 SSE。"""
+        if self.pruned:
+            return None
+        from .agent import AgentEvent
+        payload = self._payload(data)
+        self._sequence += 1
+        seq = self._sequence
+        event = AgentEvent(type=kind, data=payload, sequence=seq)
+        if kind == 'message.delta':
+            msg_id = payload.get('message_id')
+            msg_kind = payload.get('message_kind', '')
+            delta = payload.get('delta', '')
+            if msg_id:
+                entry = self._streaming.get(msg_id)
+                if entry is None:
+                    self._streaming[msg_id] = {
+                        'message_id': msg_id,
+                        'message_kind': msg_kind,
+                        'text': delta,
+                    }
+                else:
+                    entry['text'] += delta
+            if self._sink is not None:
+                await self._sink(event)
+            return event
+
+        if kind == 'message.completed':
+            msg_id = payload.get('message_id')
+            if msg_id:
+                self._streaming.pop(msg_id, None)
+
+        self._events.append(DisplayEvent(sequence=seq, type=kind, data=payload))
+        await self._persist()
+        if self._sink is not None:
+            await self._sink(event)
+        return event
+
+    async def finalize_streaming(self) -> list:
+        """将仍处于流式预览中的消息收束为 interrupted 的 message.completed 并清空缓存。"""
+        emitted = []
+        for item in list(self._streaming.values()):
+            event = await self.record('message.completed', {
+                'message_id': item['message_id'],
+                'message_kind': item['message_kind'],
+                'text': item['text'],
+                'status': 'interrupted',
+            })
+            if event is not None:
+                emitted.append(event)
+        self._streaming.clear()
+        return emitted
+
+    async def finish(self, status: str, data: dict | None = None, *, sse_data: dict | None = None):
+        """先收束未完结流式消息并持久化终态 display:<task_id>，再推送终态 SSE 事件。"""
+        if self._terminal or self.pruned:
+            return None
+        self._terminal = True
+        if self._streaming:
+            await self.finalize_streaming()
+        from .agent import AgentEvent
+        display_payload = self._payload(data or {})
+        sse_payload = self._payload(sse_data if sse_data is not None else (data or {}))
+        self._sequence += 1
+        seq = self._sequence
+        self._events.append(DisplayEvent(sequence=seq, type='task.' + status, data=display_payload))
+        await self._persist()
+        event = AgentEvent(type='task.' + status, data=sse_payload, sequence=seq)
+        if self._sink is not None:
+            await self._sink(event)
+        return event
 
 
 class PersistentJournal(MemoryJournal):
@@ -294,6 +514,12 @@ class PersistentJournal(MemoryJournal):
         self.reminders = None
         self.initial_workspace = deepcopy(task.workspace)
         self.created_workspace_key = None
+        self._start_mono = monotonic()
+
+    def _finish_timing(self, candidate: Task) -> None:
+        # 进程内耗时使用单调时钟，避免系统校时导致负数或跳变。
+        candidate.finished_at = datetime.now(timezone.utc)
+        candidate.duration_ms = max(0, int((monotonic() - self._start_mono) * 1000))
 
     def prune_rejection(self):
         if not getattr(self.repository.storage, 'supports_atomic_delete', False):
@@ -333,6 +559,9 @@ class PersistentJournal(MemoryJournal):
         snapshots = [Write('checkpoint:' + self.task.checkpoint_ids[0], 1, None)]
         if self.created_workspace_key:
             snapshots.append(Write(self.created_workspace_key, 1, None))
+        display_rec = await repo.storage.read(repo.scope, 'display:' + self.task.id)
+        if display_rec is not None:
+            snapshots.append(Write('display:' + self.task.id, display_rec.version, None))
         await repo.storage.atomic(repo.scope, [
             Write('tree', tree.version, state), ack, *snapshots, Write('task:' + self.task.id, self.version, None),
             Write('generation:' + self.task.generation_ids[0], 1, None),
@@ -363,6 +592,7 @@ class PersistentJournal(MemoryJournal):
             candidate.output_ids.append(output_id or new_tree_id())
         if final:
             candidate.status = 'complete'
+            self._finish_timing(candidate)
             candidate.result = AgentResult(answer=output, workspace=workspace,
                 intermediate=[text for kind,text in candidate.outputs if kind == 'intermediate'],
                 rounds=candidate.rounds).model_dump(mode='json')
@@ -431,6 +661,7 @@ class PersistentJournal(MemoryJournal):
         if self.status == 'generating':
             candidate = self.task.model_copy(deep=True)
             candidate.status = status
+            self._finish_timing(candidate)
             self.version = await self.repository.save(candidate, self.version)
             self.task = candidate
         if status == 'superseded':

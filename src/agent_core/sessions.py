@@ -15,13 +15,17 @@ from .core.tool.hooks import normalize_tool_hooks
 from .model.question_tree import new_tree_id
 from .scheduler import Dispatch, Reminders, SchedulerSettings, utc_now
 from .storage import StorageConflict, Write
-from .tasks import TaskRepository
+from .tasks import DisplayRecorder, TaskRepository, _completed_display_data
 
 _UNSET = object()
 
 
 class SessionExpired(RuntimeError):
     """内存会话释放后不能以同一引用继续。"""
+
+
+class ReplayUnavailableError(RuntimeError):
+    """请求的事件序号超出重放窗口或尚未产生，调用方应通过 tree()/display 快照重同步。"""
 
 
 class TaskInterrupted(RuntimeError):
@@ -110,17 +114,31 @@ class SessionTask:
             await self._activate(self.id)
         return self
 
-    async def emit(self, kind, data):
-        from .agent import AgentEvent
-        self._events.append(AgentEvent(type=kind, data={**data, 'task_id': self.id}))
-        self._sequence += 1
+    async def _push(self, event):
+        """接收已由 DisplayRecorder 统一编号的事件并唤醒 SSE 订阅者。"""
+        if event.sequence != self._sequence + 1:
+            raise RuntimeError('事件序号不连续')
+        self._events.append(event)
+        self._sequence = event.sequence
         self._changed.set()
         self._changed = asyncio.Event()
 
-    async def finish(self, status, *, result=None, error=None):
+    async def emit(self, kind, data):
+        from .agent import AgentEvent
+        self._sequence += 1
+        self._events.append(AgentEvent(type=kind, data={**data, 'task_id': self.id}, sequence=self._sequence))
+        self._changed.set()
+        self._changed = asyncio.Event()
+
+    async def finish(self, status, *, result=None, error=None, recorder=None):
         self.status, self._result, self._error = status, result, error
-        data = {'result': result.model_dump(mode='json')} if result is not None else {}
-        await self.emit('task.' + status, data)
+        sse_data = {'result': result.model_dump(mode='json')} if result is not None else {}
+        if recorder is not None and not recorder.pruned:
+            # 先将终态展示持久化到 display:<task_id>，再通过 sink 推给 SSE 订阅者，避免前端回查竞态。
+            display_data = _completed_display_data(result) if result is not None else {}
+            await recorder.finish(status, display_data, sse_data=sse_data)
+        else:
+            await self.emit('task.' + status, sse_data)
         self._done.set()
         self._activate = self._wake_observer = None
 
@@ -141,13 +159,18 @@ class SessionTask:
             raise self._error
         return self._result
 
-    async def events(self):
+    async def events(self, after_sequence: int = 0):
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError('after_sequence 必须为非负整数')
         with self._observe():
-            cursor = 0
+            first = self._sequence - len(self._events)
+            if after_sequence < first or after_sequence > self._sequence:
+                raise ReplayUnavailableError('事件序号超出当前内存重放窗口，请通过 tree() 快照重同步')
+            cursor = after_sequence
             while True:
                 first = self._sequence - len(self._events)
                 if cursor < first:
-                    raise RuntimeError('事件窗口已过期，请回查任务结果')
+                    raise ReplayUnavailableError('事件窗口已过期，请通过 tree() 快照重同步')
                 if cursor < self._sequence:
                     event = self._events[cursor - first]
                     cursor += 1
@@ -162,6 +185,7 @@ class SessionTask:
 class _Active:
     task: SessionTask
     control: _Control
+    display: DisplayRecorder | None = None
 
 
 class Session:
@@ -210,7 +234,8 @@ class Session:
                 target = items[index]
                 if (target['priority'] != item['priority'] or target.get('deferred')
                         or target.get('replace') is not None or target['source'] not in ('user', 'business')
-                        or target.get('parent_id', 'latest') != item.get('parent_id', 'latest')):
+                        or target.get('parent_id', 'latest') != item.get('parent_id', 'latest')
+                        or target.get('advance_head', True) != item.get('advance_head', True)):
                     continue
                 attachments = {ref['file_id']: ref for ref in target['attachments']}
                 for ref in item['attachments']:
@@ -226,15 +251,15 @@ class Session:
 
     async def submit(self, question, *, priority=0, merge_with_previous=False, source='user', attachments=(), thinking_effort='none',
                      supplemental='', replace_task_id=None, preview=True, external_id=None, created_at=None, deferred=False,
-                     guidance_factory=_UNSET, parent_id: str | None = 'latest'):
+                     guidance_factory=_UNSET, parent_id: str | None = 'latest', advance_head: bool = _UNSET):
         if type(priority) is not int or source not in ('user', 'business') or not isinstance(supplemental, str):
             raise ValueError('需要整数优先级、有效输入来源和文本上下文')
         if type(preview) is not bool:
             raise ValueError('preview 必须为布尔值')
         if external_id is not None and (not isinstance(external_id,str) or not external_id.strip()):
             raise ValueError('外部任务 ID 必须为非空字符串')
-        if type(deferred) is not bool or (deferred and replace_task_id):
-            raise ValueError('待激活任务不能同时替代在途任务')
+        if type(deferred) is not bool:
+            raise ValueError('deferred 必须为布尔值')
         if type(merge_with_previous) is not bool:
             raise ValueError('merge_with_previous 必须为布尔值')
         if merge_with_previous and (deferred or replace_task_id is not None):
@@ -244,6 +269,15 @@ class Session:
                 raise ValueError('parent_id 必须为 latest、None 或 32 位小写十六进制任务 ID')
         if replace_task_id is not None and parent_id != 'latest':
             raise ValueError('定向替代任务不能同时指定历史 parent_id')
+        if advance_head is _UNSET:
+            # 定向替代未显式指定 advance_head 时，在消费阶段沿用被替代任务的策略；普通任务默认为 True。
+            queued_advance_head = None if replace_task_id is not None else True
+        else:
+            if type(advance_head) is not bool:
+                raise ValueError('advance_head 必须为布尔值')
+            queued_advance_head = advance_head
+        if queued_advance_head is False and self.repository.workspace_retention == 'latest':
+            raise StorageConflict('workspace_retention=latest 模式下不允许 advance_head=False')
         if guidance_factory is not _UNSET and guidance_factory is not None and not callable(guidance_factory):
             raise TypeError('guidance_factory 必须可调用或为 None')
         request = AgentInput(question=question, attachments=list(attachments), source=source, thinking_effort=thinking_effort,
@@ -252,7 +286,7 @@ class Session:
         item = {'id': ticket.id, 'question': question, 'priority': priority, 'source': source,
                 'replace': replace_task_id, 'attachments': [a.model_dump(mode='json') for a in request.attachments],
                 'thinking_effort': thinking_effort, 'supplemental': supplemental, 'preview': preview,
-                'parent_id': parent_id}
+                'parent_id': parent_id, 'advance_head': queued_advance_head}
         item['created_at'] = request.created_at.isoformat()
         item['deferred'] = deferred
         receipt_key = None
@@ -263,6 +297,8 @@ class Session:
             # 默认请求保持旧版指纹，历史 external_id 可继续重投。
             if parent_id == 'latest':
                 fingerprint.pop('parent_id', None)
+            if fingerprint.get('advance_head') is not False:
+                fingerprint.pop('advance_head', None)
             if merge_with_previous:
                 fingerprint['merge_with_previous'] = True
             fingerprint = hashlib.sha256(json.dumps(fingerprint,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
@@ -351,14 +387,16 @@ class Session:
             if queue and any(not i.get('deferred') for i in queue.value['items']):
                 return
             ticket = SessionTask(identifier)
-            active = self._active = _Active(ticket, _Control())
+            recorder = DisplayRecorder(self.repository, identifier, sink=ticket._push)
+            active = self._active = _Active(ticket, _Control(), display=recorder)
         try:
             result = await self.runtime.agent.run(message, owner=self.owner, tree_id=self.id,
                 task_id=identifier, publish=publish, _dispatch=dispatch, _control=active.control,
+                _display=recorder,
                 _repository=self.repository, _reminder_repository=self._reminder_repository, _session_tools=self.tools, _role=self.role,
                 **({'_guidance_factory': self.guidance_factory} if self.guidance_factory is not None else {}),
                 **({'_tool_hooks': dict(self.tool_hooks)} if self.tool_hooks else {}))
-            await ticket.finish('completed', result=result)
+            await ticket.finish('completed', result=result, recorder=recorder)
             return result
         except asyncio.CancelledError:
             if not active.control.reason:
@@ -366,10 +404,11 @@ class Session:
             task, _ = await self.repository.load(identifier)
             if task.status not in ('superseded', 'cancelled'):
                 raise StorageConflict('调度任务停止终态未确认')
-            await ticket.finish(task.status, error=TaskInterrupted(task.status))
+            await ticket.finish(task.status, error=TaskInterrupted(task.status), recorder=recorder)
         finally:
             if not ticket._done.is_set():
-                await ticket.finish('failed', error=RuntimeError('调度任务未正常结束'))
+                await ticket.finish('failed', error=RuntimeError('调度任务未正常结束'),
+                                    recorder=recorder if active.control.started else None)
             self._active = None
             self.touched = monotonic()
 
@@ -530,9 +569,19 @@ class Session:
                         except StorageConflict:
                             continue
                         ticket = self._tickets.setdefault(item['id'], SessionTask(item['id']))
+                        effective_parent_id = item.get('parent_id', 'latest')
+                        effective_advance_head = item.get('advance_head', True)
                         if item['replace']:
                             old, _ = await repo.load(item['replace'])
-                            if old.status != 'superseded' or tree.value['head'] != old.id:
+                            valid_target = (
+                                old.status == 'superseded'
+                                and tree is not None
+                                and (
+                                    (old.advance_head and tree.value['head'] == old.id)
+                                    or (not old.advance_head and old.id in tree.value['tasks'])
+                                )
+                            )
+                            if not valid_target:
                                 try:
                                     await repo.storage.atomic(repo.scope, [*writes,
                                         Write('runtime_rejected:' + ticket.id, None, {'target': old.id})])
@@ -542,14 +591,24 @@ class Session:
                                 self._tickets.pop(ticket.id)
                                 self._task_guidance.pop(ticket.id, None)
                                 continue
+                            if not old.advance_head:
+                                # 被替代任务为不推进主线的分支探索时，替代任务续接该分支且默认沿用 advance_head=False。
+                                effective_parent_id = old.id
+                                if effective_advance_head is None:
+                                    effective_advance_head = False
+                            elif effective_advance_head is None:
+                                effective_advance_head = True
+                        elif effective_advance_head is None:
+                            effective_advance_head = True
                         dispatch = Dispatch(item['source'], tree.version if tree else None, writes)
-                        self._active = _Active(ticket, _Control())
+                        scheduled = item['source'] == 'reminder'
+                        recorder = DisplayRecorder(repo, ticket.id, sink=None if scheduled else ticket._push)
+                        self._active = _Active(ticket, _Control(), display=recorder)
                         ticket.status = 'running'
                 if waiting:
                     await asyncio.sleep(.05)
                     continue
                 try:
-                    scheduled = item['source']=='reminder'
                     scheduler = self._scheduler or self.runtime.agent._schedulers.get((self.owner,self.id))
                     task_guidance = self._task_guidance.get(ticket.id, _UNSET)
                     effective_guidance = (
@@ -558,10 +617,11 @@ class Session:
                         else (self.guidance_factory if self.guidance_factory is not None else _UNSET)
                     )
                     result = await self.runtime.agent.run(item['question'], owner=self.owner, tree_id=self.id,
-                        task_id=ticket.id, parent_id=item.get('parent_id', 'latest'),
+                        task_id=ticket.id, parent_id=effective_parent_id, advance_head=effective_advance_head,
                         attachments=item['attachments'], thinking_effort=item['thinking_effort'],
-                        supplemental=item['supplemental'], _events=None if scheduled else ticket.emit,
-                        publish=scheduler.publish if scheduled and scheduler else None, _preview=item.get('preview', True),
+                        supplemental=item['supplemental'], _display=recorder,
+                        publish=scheduler.publish if scheduled and scheduler else None,
+                        _preview=False if scheduled else item.get('preview', True),
                         _repository=repo, _reminder_repository=self._reminder_repository, _session_tools=self.tools,
                         _control=self._active.control, _dispatch=dispatch, _role=self.role, created_at=item.get('created_at'),
                         **({'_guidance_factory': effective_guidance} if effective_guidance is not _UNSET else {}),
@@ -575,7 +635,9 @@ class Session:
                         if await self._is_dispatch_contention(dispatch):
                             continue
                         await self._reject_queued(ticket.id, {'error_type': 'StorageConflict', 'message': str(error)})
-                    await ticket.finish('failed', error=error)
+                        await ticket.finish('failed', error=error)
+                    else:
+                        await ticket.finish('failed', error=error, recorder=recorder)
                 except KeyError as error:
                     # 指定的历史 parent_id 不存在时直接出队并结束该任务，不中断后续队列消费。
                     if not self._active.control.started:
@@ -583,19 +645,21 @@ class Session:
                             self._tickets.pop(ticket.id, None)
                             continue
                         await self._reject_queued(ticket.id, {'error_type': 'KeyError', 'message': error.args[0] if error.args else str(error)})
-                    await ticket.finish('failed', error=error)
+                        await ticket.finish('failed', error=error)
+                    else:
+                        await ticket.finish('failed', error=error, recorder=recorder)
                 except asyncio.CancelledError:
                     task, _ = await repo.load(ticket.id)
                     if task.status in ('cancelled', 'superseded'):
-                        await ticket.finish(task.status, error=TaskInterrupted(task.status))
+                        await ticket.finish(task.status, error=TaskInterrupted(task.status), recorder=recorder)
                     else:
-                        await ticket.finish('failed', error=StorageConflict('停止终态未确认，请回查任务'))
+                        await ticket.finish('failed', error=StorageConflict('停止终态未确认，请回查任务'), recorder=recorder)
                 except Exception as error:
                     if not self._active.control.started:
                         raise
-                    await ticket.finish('failed', error=error)
+                    await ticket.finish('failed', error=error, recorder=recorder)
                 else:
-                    await ticket.finish('completed', result=result)
+                    await ticket.finish('completed', result=result, recorder=recorder)
                 finally:
                     self._active = None
                     if ticket._done.is_set():
@@ -611,6 +675,12 @@ class Session:
                 self._task_guidance.clear()
                 self._worker = self._active = None
 
+    def _live_displays(self):
+        # 仅在任务已正式开始后叠加内存实时展示快照（含流式前缀与最新序号）。
+        if self._active is not None and self._active.display is not None and self._active.control.started:
+            return {self._active.task.id: self._active.display.snapshot()}
+        return None
+
     async def snapshot(self, task_id=None):
         await self.runtime.evict_idle()
         self._touch()
@@ -623,12 +693,13 @@ class Session:
             self._pins -= 1
             self.touched = monotonic()
 
-    async def tree(self):
+    async def tree(self, include_display: bool = True):
         await self.runtime.evict_idle()
         self._touch()
         self._pins += 1
         try:
-            return await self.repository.tree()
+            live_displays = self._live_displays() if include_display else None
+            return await self.repository.tree(include_display=include_display, live_displays=live_displays)
         finally:
             self._pins -= 1
             self.touched = monotonic()

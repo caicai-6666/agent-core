@@ -16,7 +16,8 @@ from .core.tool.memory_viewer import MemoryQueryViewer, build_memory_view_regist
 from .core.tool.hooks import FeedbackOnlyHook, normalize_tool_hooks
 from .core.tool.cache import SessionCacheScopes
 from .file_notes import FileNoteStore, create_file_note_cache_pool
-from .tasks import TaskRepository, PersistentJournal
+from .model.question_tree import new_tree_id
+from .tasks import DisplayRecorder, PersistentJournal, TaskRepository, _completed_display_data
 from .memory import Memory
 from .providers import Models, RuntimeSettings
 from .storage import StorageConflict
@@ -46,9 +47,13 @@ class AgentEvent(BaseModel):
     model_config = ConfigDict(frozen=True)
     type: str
     data: dict
+    sequence: int = 0
 
     def sse(self):
-        return 'event: ' + self.type + '\ndata: ' + json.dumps(self.data, ensure_ascii=False) + '\n\n'
+        payload = json.dumps(self.data, ensure_ascii=False)
+        if self.sequence > 0:
+            return f'id: {self.sequence}\nevent: {self.type}\ndata: {payload}\n\n'
+        return 'event: ' + self.type + '\ndata: ' + payload + '\n\n'
 
 
 class Agent:
@@ -115,17 +120,24 @@ class Agent:
                   parent_id='latest', attachments=(), thinking_effort='none',
                   supplemental='', publish=None, _events=None, _preview=False, _dispatch=None,
                   _repository=None, _control=None, _reminder_repository=None, _session_tools=(), _role=None,
-                  _guidance_factory=_UNSET, _tool_hooks=_UNSET, created_at=None):
+                  _guidance_factory=_UNSET, _tool_hooks=_UNSET, created_at=None,
+                  advance_head: bool = True, _display=None, _event_sink=None):
         if self._closed:
             raise RuntimeError('Agent 已关闭')
+        if type(advance_head) is not bool:
+            raise ValueError('advance_head 必须为布尔值')
         running = asyncio.current_task()
         self._running.add(running)
         journal = None
+        recorder = None
+        owns_display = False
         try:
             request = AgentInput(source=_dispatch.kind if _dispatch else 'user', question=question, attachments=list(attachments), thinking_effort=thinking_effort,
                                  **({'created_at': created_at} if created_at is not None else {}))
             repository = _repository or self.repository(owner, tree_id)
-            task, version, created = await repository.begin(request, task_id=task_id, parent_id=parent_id, dispatch=_dispatch)
+            task, version, created = await repository.begin(
+                request, task_id=task_id, parent_id=parent_id, dispatch=_dispatch, advance_head=advance_head
+            )
             if not created:
                 if task.status == 'complete' and task.result is not None:
                     if _events:
@@ -136,8 +148,20 @@ class Agent:
             journal.control = _control
             if _control:
                 _control.started = True
-            if _events:
-                await _events('task.started', {'task_id': task.id})
+            if _display is not None:
+                recorder = _display
+                owns_display = False
+            else:
+                if _event_sink is not None:
+                    sink = _event_sink
+                elif _events is not None:
+                    async def sink(event):
+                        await _events(event.type, event.data)
+                else:
+                    sink = None
+                recorder = DisplayRecorder(repository, task.id, sink=sink)
+                owns_display = True
+            await recorder.record('task.started', {'task_id': task.id})
             context = await repository.context(task.parent_id)
             context = context.model_copy(update={'supplemental': supplemental or context.supplemental})
             request = request.model_copy(update={'created_at':task.created_at, 'context':context})
@@ -249,30 +273,43 @@ class Agent:
                 if unknown_hook_tools:
                     raise ValueError(f"tool_hooks 指定了未启用或不存在的工具：{', '.join(unknown_hook_tools)}")
             observer = None
-            if _events:
-                # 条件交付/正文转换工具只能在验收后发布，不提前泄露候选正文。
-                safe_preview = all(entry.deliver_output is None and
-                    (entry.output_kind is None or all(isinstance(hook, FeedbackOnlyHook) for hook in entry.hooks))
-                    for entry in core.registry.entries.values())
-                if _preview and safe_preview:
-                    observer = InteractionOutputStream(_events, output_kinds=core.registry.output_kinds())
-                async def committed(kind, text):
-                    await _events('message.completed', {'message_kind':kind, 'text':text, 'status':'completed'})
-                publish = committed
+            user_publish = publish
+            # 条件交付/正文转换工具只能在验收后发布，不提前泄露候选正文。
+            safe_preview = all(entry.deliver_output is None and
+                (entry.output_kind is None or all(isinstance(hook, FeedbackOnlyHook) for hook in entry.hooks))
+                for entry in core.registry.entries.values())
+            if _preview and safe_preview:
+                observer = InteractionOutputStream(recorder.record, output_kinds=core.registry.output_kinds())
+
+            async def committed(kind, text):
+                # 无流式预览时复用已提交的 output_id，保证 message.completed 始终带完整标识且不重复发布。
+                message_id = journal.task.output_ids[-1] if journal.task.output_ids else new_tree_id()
+                await recorder.record('message.completed', {
+                    'message_id': message_id,
+                    'message_kind': kind,
+                    'text': text,
+                    'status': 'completed',
+                })
+                if user_publish is not None:
+                    await user_publish(kind, text)
+
+            publish = committed
+
             async def progress(value):
-                if _events:
-                    await _events('progress', asdict(value))
+                await recorder.record('progress', asdict(value))
+
             # 仅当本轮工具声明了 session 作用域缓存池时才按 (owner, tree_id) 绑定并钉住。
             if core.registry.has_pools('session'):
                 session_cache = self.cache_scopes.get(owner, tree_id)
                 with session_cache.pin():
                     result = await core.run(request, journal=journal, publish=publish,
-                        publish_progress=progress if _events else None, output_observer=observer,
+                        publish_progress=progress, output_observer=observer,
                         _session_cache=session_cache)
             else:
                 result = await core.run(request, journal=journal, publish=publish,
-                    publish_progress=progress if _events else None, output_observer=observer)
+                    publish_progress=progress, output_observer=observer)
             if journal.pruned:
+                recorder.pruned = True
                 return result
             # 交付失败不撤销答案，但幂等回读也必须保留已确认的交付失败事实。
             if journal.task.result != result.model_dump(mode='json'):
@@ -285,15 +322,35 @@ class Agent:
                 await memory.index_task(journal.task)
             except Exception as error:
                 journal.audit.append({'event':'embedding_deferred','error_type':type(error).__name__})
-                if _events:
-                    await _events('memory.deferred', {'task_id':task.id})
+                await recorder.record('memory.deferred', {'task_id':task.id})
             if task.source == 'heartbeat' and result.delivery_error_type is None:
                 await repository.acknowledge_heartbeat(task.id)
+            if owns_display:
+                await recorder.finish(
+                    'completed',
+                    _completed_display_data(result),
+                    sse_data={'result': result.model_dump(mode='json')},
+                )
             return result
-        except BaseException:
+        except BaseException as error:
             if journal is not None and journal.status == 'generating':
                 with suppress(Exception):
                     await journal.abort('cancelled' if asyncio.current_task().cancelling() else 'failed')
+            if (owns_display and recorder is not None and journal is not None
+                    and not journal.pruned and journal.status != 'generating'):
+                if isinstance(error, asyncio.CancelledError):
+                    with suppress(Exception):
+                        await recorder.finish(journal.task.status)
+                else:
+                    with suppress(Exception):
+                        await recorder.finish(
+                            journal.task.status,
+                            {'error_type': type(error).__name__},
+                            sse_data={
+                                'error_type': type(error).__name__,
+                                'message': '执行或收尾未正常结束，请通过任务 ID 回查已提交状态；不要直接重放外部动作。',
+                            },
+                        )
             raise
         finally:
             try:
@@ -305,18 +362,38 @@ class Agent:
     async def stream(self, question, *, preview=True, **kwargs):
         queue = asyncio.Queue(maxsize=64)
         listening = True
-        async def emit(kind, data):
+        sequence = 0
+        terminal_emitted = False
+
+        async def push(event):
+            nonlocal sequence, terminal_emitted
+            if event.sequence > sequence:
+                sequence = event.sequence
+            if event.type in ('task.completed', 'task.failed', 'task.cancelled', 'task.superseded'):
+                terminal_emitted = True
             if listening:
-                await queue.put(AgentEvent(type=kind, data=data))
+                await queue.put(event)
+
+        async def emit(kind, data):
+            nonlocal sequence, terminal_emitted
+            sequence += 1
+            event = AgentEvent(type=kind, data=data, sequence=sequence)
+            if kind in ('task.completed', 'task.failed', 'task.cancelled', 'task.superseded'):
+                terminal_emitted = True
+            if listening:
+                await queue.put(event)
+
         async def produce():
             try:
-                result = await self.run(question, **kwargs, _events=emit, _preview=preview)
-                await emit('task.completed', {'result':result.model_dump(mode='json')})
+                result = await self.run(question, **kwargs, _events=emit, _event_sink=push, _preview=preview)
+                if not terminal_emitted:
+                    await emit('task.completed', {'result': result.model_dump(mode='json')})
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                await emit('task.failed', {'error_type':type(error).__name__,
-                    'message':'执行或收尾未正常结束，请通过任务 ID 回查已提交状态；不要直接重放外部动作。'})
+                if not terminal_emitted:
+                    await emit('task.failed', {'error_type': type(error).__name__,
+                        'message': '执行或收尾未正常结束，请通过任务 ID 回查已提交状态；不要直接重放外部动作。'})
             finally:
                 if listening:
                     await queue.put(None)

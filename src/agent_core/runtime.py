@@ -71,11 +71,12 @@ class TreeAgent:
 
     async def generate(self, question, *, priority=0, merge_with_previous=False, external_id=None, created_at=None,
                        deferred=False, source='user', attachments=(), thinking_effort='none', supplemental='', preview=True,
-                       guidance_factory=_UNSET, parent_id: str | None = 'latest'):
+                       guidance_factory=_UNSET, parent_id: str | None = 'latest', advance_head: bool = True):
         session = await self._resident()
         return await session.submit(question,priority=priority,merge_with_previous=merge_with_previous,external_id=external_id,created_at=created_at,
             deferred=deferred,source=source,attachments=attachments,thinking_effort=thinking_effort,
-            supplemental=supplemental,preview=preview,guidance_factory=guidance_factory,parent_id=parent_id)
+            supplemental=supplemental,preview=preview,guidance_factory=guidance_factory,parent_id=parent_id,
+            advance_head=advance_head)
 
     async def activate(self, task_id):
         return await (await self._resident()).activate(task_id)
@@ -96,8 +97,8 @@ class TreeAgent:
     async def snapshot(self, task_id=None):
         return await (await self._resident()).snapshot(task_id)
 
-    async def tree(self):
-        return await (await self._resident()).tree()
+    async def tree(self, include_display: bool = True):
+        return await (await self._resident()).tree(include_display=include_display)
 
     async def scheduler(self, **options):
         return (await self._resident()).scheduler(**options)
@@ -195,13 +196,20 @@ class AgentRuntime:
                 context,reminders=repo,tools=tools,role=role,guidance_factory=guidance_factory,tool_hooks=tool_hooks)
         return TreeAgent(self,session,tree_id)
 
-    async def tree(self, tree_id: str, *, database=None):
+    async def tree(self, tree_id: str, *, database=None, include_display: bool = True):
         """只读获取数据库中整棵任务树的结构视图，无需预先装配角色或工具。"""
+        if type(include_display) is not bool:
+            raise ValueError('include_display 必须为布尔值')
         engine = self._engine_for(database)
         _, state = await self._metadata(engine, tree_id)
         repo = TaskRepository(engine.storage, owner=self._owner, tree_id=tree_id,
                               workspace_retention=state.get('workspace_retention', 'per_node'))
-        return await repo.tree()
+        live_displays = None
+        if include_display:
+            resident = engine.sessions.resident(self._owner, tree_id)
+            if resident is not None:
+                live_displays = resident._live_displays()
+        return await repo.tree(include_display=include_display, live_displays=live_displays)
 
     async def close(self):
         self._closed = True
