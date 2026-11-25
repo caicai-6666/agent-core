@@ -9,11 +9,11 @@ from .core import AgentCore, AgentInput, AgentResult, CoreSettings, AgentCoreErr
 from .core.model import ContextInjection
 from .core.prompt import build_system_prompt
 from .core.subgraph.memory_retrieval import create_memory_cache_pool
-from .core.tool import ToolRegistry, FinishTaskTool, build_builtin_registrations
+from .core.tool import BaseTool, ToolRegistry, FinishTaskTool, build_builtin_registrations
 from .core.tool.file_notes import FILE_NOTE_TOOL_NAMES, FileNoteTools
 from .core.tool.memory_search import build_memory_search_registration
 from .core.tool.memory_viewer import MemoryQueryViewer, build_memory_view_registration
-from .core.tool.hooks import FeedbackOnlyHook
+from .core.tool.hooks import FeedbackOnlyHook, normalize_tool_hooks
 from .core.tool.cache import SessionCacheScopes
 from .file_notes import FileNoteStore, create_file_note_cache_pool
 from .tasks import TaskRepository, PersistentJournal
@@ -22,7 +22,7 @@ from .providers import Models, RuntimeSettings
 from .storage import StorageConflict
 from .output_stream import InteractionOutputStream
 from .tools import build_progress_tool
-from .heartbeat import scheduled_finish
+from .heartbeat import scheduled_finish, supports_heartbeat_pruning, wrap_heartbeat_prune_guard
 from .reminder_tools import ReminderTools
 from .sessions import SessionRuntime
 from .scheduler import AgentScheduler, Reminders, SchedulerSettings
@@ -56,7 +56,7 @@ class Agent:
                  tools=(), tool_factory=None, builtin_names=None, finish_task=None,
                  memory_tools=True, reminder_tools=False,
                  file_note_tools: bool = False, file_note_authorize=None,
-                 guidance_factory=None,
+                 guidance_factory=None, tool_hooks=None,
                  session_capacity=100, session_ttl_seconds=1800, workspace_retention="per_node"):
         if not isinstance(role, str) or not role.strip():
             raise ValueError('必须提供业务角色提示词')
@@ -81,6 +81,7 @@ class Agent:
         self.file_note_tools = file_note_tools
         self.file_note_authorize = file_note_authorize
         self.guidance_factory = guidance_factory
+        self.tool_hooks = normalize_tool_hooks(tool_hooks)
         self._schedulers = {}
         self._running = set()
         self._closed = False
@@ -114,7 +115,7 @@ class Agent:
                   parent_id='latest', attachments=(), thinking_effort='none',
                   supplemental='', publish=None, _events=None, _preview=False, _dispatch=None,
                   _repository=None, _control=None, _reminder_repository=None, _session_tools=(), _role=None,
-                  _guidance_factory=_UNSET, created_at=None):
+                  _guidance_factory=_UNSET, _tool_hooks=_UNSET, created_at=None):
         if self._closed:
             raise RuntimeError('Agent 已关闭')
         running = asyncio.current_task()
@@ -170,17 +171,47 @@ class Agent:
                     cache_pool=file_note_cache_pool,
                 ).registrations()
                 entries += [tool for tool in note_entries if not managed or tool.name in selected]
-            custom_finish = managed and any(tool.name=='finish_task' for tool in custom)
-            scheduled = not custom_finish and task.source in ('heartbeat', 'reminder') and type(self.finish_task) is FinishTask and not self.finish_task.hooks
+            effective_tool_hooks = self.tool_hooks if _tool_hooks is _UNSET else normalize_tool_hooks(_tool_hooks)
+            hook_map = dict(effective_tool_hooks)
+
+            def attach_hooks(entry):
+                if isinstance(entry, BaseTool):
+                    entry = entry.build_registration()
+                extra = hook_map.get(entry.name)
+                return entry.with_hooks(*extra) if extra else entry
+
+            entries = [attach_hooks(entry) for entry in entries]
+            custom_finish = managed and any(tool.name == 'finish_task' for tool in custom)
+            default_finish = not custom_finish and type(self.finish_task) is FinishTask and not self.finish_task.hooks
+            scheduled = default_finish and task.source in ('heartbeat', 'reminder')
             journal.allow_prune = scheduled and task.source == 'heartbeat'
-            finish = scheduled_finish(journal) if scheduled else self.finish_task.build_registration()
             if not custom_finish:
+                finish = scheduled_finish(journal) if scheduled else self.finish_task.build_registration()
+                finish = attach_hooks(finish)
+                # 默认心跳 finish_task 附加外部钩子时，用裁剪守卫包裹以确保裁剪拒绝跳过额外业务钩子；
+                # 自定义 FinishTask 子类或挂钩子时，若满足心跳裁剪契约仍可启用安全静默裁剪。
+                if task.source == 'heartbeat' and (
+                    (scheduled and 'finish_task' in hook_map)
+                    or (not scheduled and supports_heartbeat_pruning(finish))
+                ):
+                    journal.allow_prune = True
+                    finish = wrap_heartbeat_prune_guard(finish, journal)
                 entries.append(finish)
             if not managed:
-                entries.extend(self.tools)
-            entries.extend(custom)
+                entries.extend(attach_hooks(tool) for tool in self.tools)
+            if custom_finish and task.source == 'heartbeat':
+                wrapped_custom = []
+                for tool in custom:
+                    tool = attach_hooks(tool)
+                    if tool.name == 'finish_task' and supports_heartbeat_pruning(tool):
+                        journal.allow_prune = True
+                        tool = wrap_heartbeat_prune_guard(tool, journal)
+                    wrapped_custom.append(tool)
+                entries.extend(wrapped_custom)
+            else:
+                entries.extend(attach_hooks(tool) for tool in custom)
             if self.tool_factory and not managed:
-                entries += list(self.tool_factory(ToolContext(repository, journal, memory)))
+                entries += [attach_hooks(tool) for tool in self.tool_factory(ToolContext(repository, journal, memory))]
             effective_guidance = self.guidance_factory if _guidance_factory is _UNSET else _guidance_factory
             if effective_guidance is not None and not callable(effective_guidance):
                 raise TypeError('guidance_factory 必须可调用或为 None')
@@ -211,8 +242,12 @@ class Agent:
                         ),
                     ),
                 ]
-                entries += [tool for tool in memory_entries if not managed or tool.name in selected]
+                entries += [attach_hooks(tool) for tool in memory_entries if not managed or tool.name in selected]
                 core = core.with_registry(ToolRegistry(entries))
+            if hook_map:
+                unknown_hook_tools = sorted(set(hook_map) - set(core.registry.entries))
+                if unknown_hook_tools:
+                    raise ValueError(f"tool_hooks 指定了未启用或不存在的工具：{', '.join(unknown_hook_tools)}")
             observer = None
             if _events:
                 # 条件交付/正文转换工具只能在验收后发布，不提前泄露候选正文。

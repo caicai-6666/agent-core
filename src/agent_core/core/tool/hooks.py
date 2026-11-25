@@ -1,5 +1,5 @@
 """工具独立的执行后钩子；上下文提供宿主事实与私有审计能力。"""
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from inspect import isawaitable
 
@@ -47,3 +47,30 @@ class FeedbackOnlyHook:
                 or value.result.system_guidence != original.system_guidence):
             raise ValueError('反馈专用钩子只能修改展示内容')
         return value
+
+
+NormalizedToolHooks = tuple[tuple[str, tuple[ToolHook, ...]], ...]
+
+
+def normalize_tool_hooks(
+    tool_hooks: Mapping[str, Sequence[ToolHook]] | None,
+) -> NormalizedToolHooks:
+    """规范化并严格校验按工具名附加的钩子映射，返回不可变且可值比较的有序元组。"""
+    if tool_hooks is None:
+        return ()
+    if not isinstance(tool_hooks, Mapping):
+        raise TypeError('tool_hooks 必须为工具名到钩子序列的映射或 None')
+    normalized: dict[str, tuple[ToolHook, ...]] = {}
+    for name, hooks in tool_hooks.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError('tool_hooks 的键必须为非空工具名称字符串')
+        # 拒绝裸字符串、字节串以及裸可调用对象，避免被按字符拆解或静默误用。
+        if not isinstance(hooks, Sequence) or isinstance(hooks, (str, bytes, bytearray)):
+            raise TypeError(f'工具 {name!r} 的钩子必须为非空可调用序列')
+        hook_tuple = tuple(hooks)
+        if not hook_tuple:
+            raise ValueError(f'工具 {name!r} 的钩子序列不能为空')
+        if any(not callable(hook) for hook in hook_tuple):
+            raise TypeError(f'工具 {name!r} 存在不可调用的钩子')
+        normalized[name] = hook_tuple
+    return tuple(sorted(normalized.items()))

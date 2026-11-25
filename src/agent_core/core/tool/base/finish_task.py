@@ -9,6 +9,16 @@ from ..hooks import FeedbackOnlyHook
 
 def render_finish_feedback(arguments, execution, context):
     if execution.result.status != 'succeeded':
+        data = execution.result.tool_result
+        if execution.result.content.text is None and 'reason' in data and 'required_action' in data:
+            text = dedent(f"""
+                ### 任务结束
+
+                状态：任务未结束
+                原因：{data['reason']}
+                下一步：{data['required_action']}
+            """).strip()
+            return with_feedback(execution, text)
         return execution
     # 工具成功后结束循环；回执供已提交历史恢复，不声称外部消息已送达。
     text = dedent("""

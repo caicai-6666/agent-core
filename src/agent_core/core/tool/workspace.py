@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, StringConstraints, model_validator
 from ..json_codec import load_model_json,normalize_model_json,ModelActionRejected
 from ..workspace import (WorkspaceObject,WorkspaceText,WorkspaceKey,WorkspacePayload,
     WorkspaceKnownInformation,WorkspaceRemainingDirection,WorkspaceExploredDirection)
-from .hooks import ToolHookContext
+from .hooks import FeedbackOnlyHook, ToolHookContext
 from .result import OrdinaryToolContent, ToolExecution
 
 WorkspacePath = Annotated[str, StringConstraints(strict=True, pattern=r'^/[a-z][a-z0-9_]*(/[a-z][a-z0-9_]*)*$')]
@@ -161,16 +161,31 @@ def render_workspace_feedback(
     execution: ToolExecution,
     context: ToolHookContext,
 ) -> ToolExecution:
-    # 参数及引用拒绝发生在预演阶段，由原校验分支反馈；此处不重做编辑或分配 ID。
-    if execution.result.status != 'succeeded':
-        return execution
-
     if isinstance(arguments, WorkspaceAddArguments):
         title, label = '工作区新增', '目标容器'
     elif isinstance(arguments, WorkspaceReplaceArguments):
         title, label = '工作区替换', '目标路径'
     else:
         title, label = '工作区删除', '目标路径'
+
+    # 参数及引用拒绝发生在预演阶段，由原校验分支反馈；业务钩子显式失败时在此渲染失败回执。
+    if execution.result.status != 'succeeded':
+        data = execution.result.tool_result
+        if execution.result.content.text is None and 'reason' in data and 'required_action' in data:
+            text = dedent(f"""
+                ### {title}
+
+                状态：操作未完成，本次未修改工作区
+                原因：{data['reason']}
+                下一步：{data['required_action']}
+            """).strip()
+            return replace(
+                execution,
+                result=execution.result.model_copy(
+                    update={'content': OrdinaryToolContent(text=text)},
+                ),
+            )
+        return execution
 
     # 独立调用注册表并不意味着已提交工作区，不能冒充完整宿主的成功反馈。
     feedback = context.workspace_feedback or '状态：编辑已通过预演，等待宿主提交。'
@@ -223,7 +238,7 @@ def build_workspace_registrations():
             model,
             prepare,
             partial(parse_workspace_tool_arguments, name),
-            hooks=(render_workspace_feedback,),
+            hooks=(FeedbackOnlyHook(render_workspace_feedback),),
         )
         for name, model in _MODELS.items()
     ]

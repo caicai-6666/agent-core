@@ -7,6 +7,15 @@ from .core.tool.feedback import with_feedback
 
 def render_progress(arguments, execution, context):
     if execution.result.status != 'succeeded':
+        data = execution.result.tool_result
+        if execution.result.content.text is None and 'reason' in data and 'required_action' in data:
+            return with_feedback(execution, dedent(f'''
+                ### 中途说明
+
+                状态：中途说明未提交
+                原因：{data['reason']}
+                下一步：{data['required_action']}
+            ''').strip())
         return execution
     return with_feedback(execution, dedent('''
         ### 中途说明

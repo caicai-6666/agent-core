@@ -24,12 +24,21 @@ logger = logging.getLogger(__name__)
 def render_create_reminder_feedback(arguments, execution, context):
     result = execution.result.tool_result
     if execution.result.status != 'succeeded':
-        text = dedent("""
-            ### 提醒创建
+        if 'message' in result:
+            text = dedent("""
+                ### 提醒创建
 
-            状态：创建失败，本次未提交
-            原因及处理方向：{message}
-        """).strip().format(**result)
+                状态：创建失败，本次未提交
+                原因及处理方向：{message}
+            """).strip().format(**result)
+        else:
+            text = dedent("""
+                ### 提醒创建
+
+                状态：创建失败，本次未提交
+                原因：{reason}
+                下一步：{required_action}
+            """).strip().format(**result)
     else:
         text = dedent("""
             ### 提醒创建
@@ -47,12 +56,21 @@ def render_create_reminder_feedback(arguments, execution, context):
 def render_delete_reminder_feedback(arguments, execution, context):
     result = execution.result.tool_result
     if execution.result.status != 'succeeded':
-        text = dedent("""
-            ### 提醒删除
+        if 'message' in result:
+            text = dedent("""
+                ### 提醒删除
 
-            状态：删除失败，本次未提交
-            原因及处理方向：{message}
-        """).strip().format(**result)
+                状态：删除失败，本次未提交
+                原因及处理方向：{message}
+            """).strip().format(**result)
+        else:
+            text = dedent("""
+                ### 提醒删除
+
+                状态：删除失败，本次未提交
+                原因：{reason}
+                下一步：{required_action}
+            """).strip().format(**result)
     else:
         text = dedent("""
             ### 提醒删除
@@ -67,12 +85,21 @@ def render_delete_reminder_feedback(arguments, execution, context):
 def render_list_reminders_feedback(arguments, execution, context):
     result = execution.result.tool_result
     if execution.result.status != 'succeeded':
-        text = dedent("""
-            ### 提醒查看
+        if 'message' in result:
+            text = dedent("""
+                ### 提醒查看
 
-            状态：查询失败
-            原因及处理方向：{message}
-        """).strip().format(**result)
+                状态：查询失败
+                原因及处理方向：{message}
+            """).strip().format(**result)
+        else:
+            text = dedent("""
+                ### 提醒查看
+
+                状态：查询失败
+                原因：{reason}
+                下一步：{required_action}
+            """).strip().format(**result)
         return with_feedback(execution, text)
     if not result['count']:
         text = dedent("""

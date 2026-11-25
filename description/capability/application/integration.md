@@ -64,6 +64,7 @@ await database.close()
 - `created_at` 可传业务事件的带时区时间，用作模型的任务时间。省略时取提交时间。
 - `deferred=True` 登记任务后等待显式激活；宿主可在首次订阅时调用 `await job.activate()`。重启后恢复实例并调用 `await agent.activate(task_id)` 可重新获得句柄。等待激活的任务不会阻塞其他已就绪任务。
 - `guidance_factory` 可在 `create`、`restore` 绑定会话默认临时请求提示策略（如 `ProgressGuidance.factory(interval_seconds=60.0)`），也可在 `generate(..., guidance_factory=...)` 按单任务覆盖或传 `None` 临时关闭。工厂为进程内 Python 回调，不写入持久队列 JSON；`ProgressGuidance.factory(...)` 支持按参数值比较相等，便于持久实例 `restore` 核对配置一致性，空闲驱逐后冷重绑自动保留原工厂。
+- `tool_hooks` 可在 `Agent`、`AgentRuntime.create`、`AgentRuntime.restore`（含持久恢复与分身）及 `agent.sessions.*` 上按工具名称附加执行后钩子（`Mapping[str, Sequence[ToolHook]]`），适用于所有静态与动态装配的内置工具（包括 `workspace_*`、`compact_context`、`emit_progress`、`finish_task`、`search_memory`、`view_memory_query`、`*_reminder`、`*_file_note*`）以及自定义工具。注册表在装配时调用 `RegisteredTool.with_hooks(*hooks)`，将新增业务钩子插入已有业务钩子之后、末尾 `FeedbackOnlyHook` 之前，不破坏原注册项的不可变性与渲染契约；指定未启用或不存在的工具名立即抛出 `ValueError`。钩子为进程内回调，不写入树存储；持久实例空闲驱逐重绑时自动保留，驻留重开时核对一致性。为默认心跳 `finish_task` 附加业务钩子时仍保留安全静默裁剪：`ToolOperationFailed` 会阻断裁剪并向模型反馈原因，裁剪前置拒绝时跳过额外业务钩子。
 - `await agent.tree()` 与 `await runtime.tree(tree_id, database=None)` 返回只读 `TreeView`（含 `tree_id`、`head`、`active`、`workspace_retention` 及按创建顺序排列的全量 `TreeNode` 列表，覆盖主线与全部历史分支，不含工作区大对象与私有审计）。`runtime.tree(...)` 无需预先装配角色或工具即可打开整棵树渲染，找不到树时抛出 `KeyError`。
 - `agent.recover(task_id)` 用于宿主确认旧执行进程已经停止后的故障收束。任务不会重放。
 - 新接口使用数据库内固定的树命名空间。接续旧 `Agent` 创建的树时，用 `AgentRuntime(..., legacy_owner=原owner)` 绑定其原有命名空间；原数据库的执行模式与工作区策略继续有效。拥有同名树的多个旧 owner 应分别绑定。
@@ -163,7 +164,7 @@ tool = RegisteredTool("project_schedule", "按项目全称查询交付计划。"
 
 默认参数解析器按工具的 Pydantic Schema 解码模型输出的对象和数组，包括多编码成 JSON 文本的字段。对带 discriminator 的联合类型，解析器只处理标签选定分支的字段。普通文本按原值传入，后续业务类型校验继续生效。
 
-所有字段（含嵌套和动态属性）必须具有准确 description；注册时检查实际 JSON Schema。工具主体返回结构化结果，末尾 `FeedbackOnlyHook` 只渲染正文。业务钩子按工具独立、顺序运行，不能修改执行状态；失败同样提供友好反馈。
+所有字段（含嵌套和动态属性）必须具有准确 description；注册时检查实际 JSON Schema。工具主体返回结构化结果，末尾 `FeedbackOnlyHook` 只渲染正文。业务钩子按工具独立、顺序运行，不能修改执行状态；失败同样提供友好反馈。对已有 `RegisteredTool` 追加钩子可使用 `entry.with_hooks(*hooks)`，该方法返回新注册项并将新业务钩子插在末尾 `FeedbackOnlyHook` 之前，新 `FeedbackOnlyHook` 追加在末尾；为静态或动态装配的内置工具挂钩子时，直接在 `Agent`、`AgentRuntime.create`/`restore` 或 `Session` 上传入 `tool_hooks={"tool_name": [hook]}` 即可。
 
 外部写操作须自行支持幂等，可信调用 ID 可从 `core.tool.registry.current_tool_call_id` 取得。`persist_result=True` 可随检查点保存结构化结果。`ToolExecution.after_commit` 只在提交成功后执行；它不是跨数据库分布式事务。可靠外部交付仍应由宿主提供 outbox/幂等接口，禁止把提交后网络发送描述为原子保证。
 
@@ -230,7 +231,7 @@ await agent.close()
 - **心跳**：`heartbeat_interval_seconds=-1` 关闭，正整数开启。首次空闲扫描即可触发，以最近一次确认完成的心跳计时。省略 `heartbeat_message` 时使用“请结合已有记忆、工作区和待办，检查现在是否有值得推进、核查或整理的事项。”任务输入和历史均标记为系统心跳，记忆索引中仅收录该任务的公开输出。
 - **定时任务**：`reminder_tools=True` 注册 `create_reminder`、`list_reminders`、`delete_reminder`。支持一次性、固定秒数间隔以及按时区的日、周、月排期。默认时区为 Asia/Shanghai。月末缺日策略需明确选择；夏令时跳过不存在的时刻，重复时刻取第一次。创建或取消与工具检查点一起提交。已入队的提醒保留，停机错过多个周期时合并为一次。仅使用提醒时，保留心跳间隔默认值并启动调度器。
 - **运行方式**：可以让宿主周期性等待 `scheduler.tick()` 代替 `start()`；一次检查最多执行一个到期任务。按已登记的任务树逐个恢复调度器，提醒排期、队列与心跳确认时间从数据库恢复。到期提醒优先，当前执行中的任务继续运行。库使用同一存储适配器完成入队与领取，外部员工目录、消息中间件和钉钉交付由宿主接入。业务系统另有用户消息积压时，应在业务队列空闲后调用 `tick()`。
-- **收尾与裁剪**：默认结束工具通过 `send_to_user` 决定是否调用宿主交付回调。空转心跳可在首次主生成中用 `finish_task(content="无新事项", send_to_user=false, prune_current_task=true)` 静默裁剪。已执行其他工具、产生额外生成或摘要、发生纠错、修改业务工作区、携带附件或需要通知时，保留该轮。模型可根据拒绝反馈改为正常结束。宿主自定义结束工具或附加结束钩子时沿用其交付行为，标准静默裁剪仅用于库可验证的默认结束工具。
+- **收尾与裁剪**：默认结束工具通过 `send_to_user` 决定是否调用宿主交付回调。空转心跳可在首次主生成中用 `finish_task(content="无新事项", send_to_user=false, prune_current_task=true)` 静默裁剪。已执行其他工具、产生额外生成或摘要、发生纠错、修改业务工作区、携带附件或需要通知时，保留该轮；模型可根据拒绝反馈改为正常结束。自定义 `finish_task`（包括通过 `AgentRuntime.create(tools=[...])` 传入的自定义 `RegisteredTool('finish_task', ...)`，以及自定义 `FinishTaskTool` 子类或附加钩子）若同时满足裁剪契约——`output_kind='final'`、声明 `deliver_output` 回调、且参数模型包含 `bool` 类型的 `send_to_user` 与 `prune_current_task`（推荐直接继承 `HeartbeatFinishArguments`，可用 `supports_heartbeat_pruning(entry)` 检查）——运行时会自动包装心跳裁剪守卫并启用同事务静默裁剪；未声明该契约的自定义结束工具仍可正常执行心跳，只是关闭裁剪并保留完整记录。
 - **故障处理**：心跳执行失败、进程崩溃或交付未确认时，后续心跳等待宿主核实。通过该作用域 `heartbeat` 记录的 `heartbeat_pending` 定位任务；若仍在执行态，先按故障恢复流程终止旧执行，再在确认处理结果后调用 `await agent.repository(user_id, tree_id).acknowledge_heartbeat(task_id)`。确认操作启动下一个间隔。存储事务和裁剪适配方式见[存储契约](../../architecture/data/storage.md#调度与心跳裁剪)。
 
 ---

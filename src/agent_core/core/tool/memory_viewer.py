@@ -39,7 +39,10 @@ def render_memory_view_feedback(arguments, execution, context):
             状态：查看失败
             原因：{message}
             下一步：{required_action}
-        """).strip().format(**result)
+        """).strip().format(
+            message=result.get('message', result.get('reason')),
+            required_action=result['required_action'],
+        )
         content = OrdinaryToolContent(text=text)
     else:
         next_step = (

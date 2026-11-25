@@ -19,7 +19,7 @@ from .file_notes import (
     render_view_file_note_query_feedback,
 )
 from .file_search import build_file_search_registration, render_file_search_feedback
-from .hooks import ToolHook, ToolHookContext
+from .hooks import ToolHook, ToolHookContext, normalize_tool_hooks
 from .memory_search import build_memory_search_registration, render_memory_search_feedback
 from .memory_viewer import MemoryQueryViewer, build_memory_view_registration, render_memory_view_feedback
 from .pdf_viewer import ViewPDFArguments, build_pdf_view_registration, render_pdf_feedback
@@ -93,6 +93,7 @@ __all__ = [
     'build_context_registrations',
     'ToolHook',
     'ToolHookContext',
+    'normalize_tool_hooks',
     'ToolExecution',
     'ToolExecutionResult',
     'ToolGuidance',

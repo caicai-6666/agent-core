@@ -86,7 +86,10 @@ def render_add_file_note_feedback(arguments, execution, context):
             状态：添加失败，本次未写入
             原因：{message}
             下一步：{required_action}
-        """).strip().format(**result)
+        """).strip().format(
+            message=result.get('message', result.get('reason')),
+            required_action=result['required_action'],
+        )
     else:
         text = dedent("""
             ### 文件备忘添加
@@ -123,7 +126,10 @@ def render_delete_file_note_feedback(arguments, execution, context):
             状态：删除失败，当前状态未确认变更
             原因：{message}
             下一步：{required_action}
-        """).strip().format(**result)
+        """).strip().format(
+            message=result.get('message', result.get('reason')),
+            required_action=result['required_action'],
+        )
     else:
         state = '已删除' if result['deleted'] else '备忘已不存在，无需删除'
         text = dedent("""
@@ -144,7 +150,10 @@ def render_search_file_notes_feedback(arguments, execution, context):
             状态：检索失败，未生成可查看的结果集
             原因：{message}
             下一步：{required_action}
-        """).strip().format(**result)
+        """).strip().format(
+            message=result.get('message', result.get('reason')),
+            required_action=result['required_action'],
+        )
         return with_feedback(execution, text)
     if result['total'] == 0:
         lines = [
@@ -182,7 +191,10 @@ def render_view_file_note_query_feedback(arguments, execution, context):
             状态：查看失败，本次未返回页面
             原因：{message}
             下一步：{required_action}
-        """).strip().format(**result)
+        """).strip().format(
+            message=result.get('message', result.get('reason')),
+            required_action=result['required_action'],
+        )
         content = OrdinaryToolContent(text=text)
         return replace(execution, result=execution.result.model_copy(update={'content': content}))
     truncation_note = (

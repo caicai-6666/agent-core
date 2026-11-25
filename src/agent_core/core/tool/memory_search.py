@@ -23,12 +23,21 @@ from .result import OrdinaryToolContent, ToolExecutionResult
 def render_memory_search_feedback(arguments, execution, context):
     result = execution.result.tool_result
     if execution.result.status == 'failed':
-        text = dedent("""
-            ### 记忆检索
+        if 'message' in result:
+            text = dedent("""
+                ### 记忆检索
 
-            状态：查询失败，未生成可查看的结果集。
-            原因及处理方向：{message}
-        """).strip().format(message=result['message'])
+                状态：查询失败，未生成可查看的结果集。
+                原因及处理方向：{message}
+            """).strip().format(message=result['message'])
+        else:
+            text = dedent("""
+                ### 记忆检索
+
+                状态：查询失败，未生成可查看的结果集。
+                原因：{reason}
+                下一步：{required_action}
+            """).strip().format(**result)
     elif result['total'] == 0:
         text = dedent("""
             ### 记忆检索

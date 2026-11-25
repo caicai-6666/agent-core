@@ -64,6 +64,22 @@ class RegisteredTool:
                 raise ValueError(f'作用域 {pool.scope!r} 中已存在同名的不同 CachePool 实例：{pool.name!r}')
             seen_pools[key] = pool
 
+    def with_hooks(self, *hooks: ToolHook) -> 'RegisteredTool':
+        """追加执行后钩子并返回新注册项；新业务钩子插在末尾纯展示钩子之前，不修改原对象。"""
+        if not hooks:
+            return self
+        if any(not callable(hook) for hook in hooks):
+            raise TypeError('工具钩子必须可调用')
+        # 保持末尾 FeedbackOnlyHook 不变式：仅拆分尾部连续纯展示钩子，新业务钩子在其之前运行。
+        split = len(self.hooks)
+        while split > 0 and isinstance(self.hooks[split - 1], FeedbackOnlyHook):
+            split -= 1
+        existing_business = self.hooks[:split]
+        existing_feedback = self.hooks[split:]
+        new_business = tuple(hook for hook in hooks if not isinstance(hook, FeedbackOnlyHook))
+        new_feedback = tuple(hook for hook in hooks if isinstance(hook, FeedbackOnlyHook))
+        return replace(self, hooks=(*existing_business, *new_business, *existing_feedback, *new_feedback))
+
     def definition(self):
         return {'type':'function','function':{'name':self.name,'description':self.description,
             'parameters':self.arguments_model.model_json_schema(),'strict':False}}

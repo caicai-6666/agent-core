@@ -5,7 +5,7 @@ from textwrap import dedent
 from pydantic import Field
 
 from ..workspace import WorkspaceObject, WorkspaceText
-from .hooks import ToolHookContext
+from .hooks import FeedbackOnlyHook, ToolHookContext
 from .result import OrdinaryToolContent, ToolExecution
 
 
@@ -20,6 +20,21 @@ def render_context_feedback(
 ) -> ToolExecution:
     # 整理与验收由宿主完成；钩子只展示确认后的范围，不重新生成摘要。
     if execution.result.status != 'succeeded':
+        data = execution.result.tool_result
+        if execution.result.content.text is None and 'reason' in data and 'required_action' in data:
+            text = dedent(f"""
+                ### 上下文整理
+
+                状态：整理未完成，上下文未修改
+                原因：{data['reason']}
+                下一步：{data['required_action']}
+            """).strip()
+            return replace(
+                execution,
+                result=execution.result.model_copy(
+                    update={'content': OrdinaryToolContent(text=text)},
+                ),
+            )
         return execution
 
     if context.compacted_turns is None:
@@ -63,6 +78,6 @@ def build_context_registrations():
             ),
             CompactArguments,
             prepare,
-            hooks=(render_context_feedback,),
+            hooks=(FeedbackOnlyHook(render_context_feedback),),
         ),
     ]

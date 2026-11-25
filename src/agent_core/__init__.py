@@ -12,6 +12,7 @@ from .core.tool.hooks import FeedbackOnlyHook
 from .providers import VLLMClient, VLLMSettings, GenerationSettings, VLLMEmbedding
 from .tools import build_progress_tool
 from .scheduler import SchedulerSettings
+from .heartbeat import HeartbeatFinishArguments, ScheduledFinishArguments, supports_heartbeat_pruning
 
 from .sessions import SessionRuntime, Session, SessionTask, SessionExpired, TaskInterrupted
 from .runtime import AgentRuntime, TreeAgent
