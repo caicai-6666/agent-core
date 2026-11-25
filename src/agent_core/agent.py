@@ -7,7 +7,8 @@ import json
 from pydantic import BaseModel, ConfigDict
 from .core import AgentCore, AgentInput, AgentResult, CoreSettings, AgentCoreError
 from .core.model import ContextInjection
-from .core.prompt import build_system_prompt
+from .core.prompt import PromptOptions, build_system_prompt, resolve_prompt_flags
+from .core.workspace import empty_workspace
 from .core.subgraph.memory_retrieval import create_memory_cache_pool
 from .core.tool import BaseTool, ToolRegistry, FinishTaskTool, build_builtin_registrations
 from .core.tool.file_notes import FILE_NOTE_TOOL_NAMES, FileNoteTools
@@ -61,7 +62,7 @@ class Agent:
                  tools=(), tool_factory=None, builtin_names=None, finish_task=None,
                  memory_tools=True, reminder_tools=False,
                  file_note_tools: bool = False, file_note_authorize=None,
-                 guidance_factory=None, tool_hooks=None,
+                 guidance_factory=None, tool_hooks=None, prompt_options: PromptOptions | None = None,
                  session_capacity=100, session_ttl_seconds=1800, workspace_retention="per_node"):
         if not isinstance(role, str) or not role.strip():
             raise ValueError('必须提供业务角色提示词')
@@ -73,6 +74,8 @@ class Agent:
             raise TypeError('file_note_authorize 必须可调用或为 None')
         if guidance_factory is not None and not callable(guidance_factory):
             raise TypeError('guidance_factory 必须可调用或为 None')
+        if prompt_options is not None and not isinstance(prompt_options, PromptOptions):
+            raise TypeError('prompt_options 必须为 PromptOptions 实例或 None')
         self.workspace_retention = workspace_retention
         self.models, self.storage, self.role = models, storage, role
         self.settings = settings or RuntimeSettings()
@@ -87,6 +90,7 @@ class Agent:
         self.file_note_authorize = file_note_authorize
         self.guidance_factory = guidance_factory
         self.tool_hooks = normalize_tool_hooks(tool_hooks)
+        self.prompt_options = prompt_options or PromptOptions()
         self._schedulers = {}
         self._running = set()
         self._closed = False
@@ -120,12 +124,14 @@ class Agent:
                   parent_id='latest', attachments=(), thinking_effort='none',
                   supplemental='', publish=None, _events=None, _preview=False, _dispatch=None,
                   _repository=None, _control=None, _reminder_repository=None, _session_tools=(), _role=None,
-                  _guidance_factory=_UNSET, _tool_hooks=_UNSET, created_at=None,
-                  advance_head: bool = True, _display=None, _event_sink=None):
+                  _guidance_factory=_UNSET, _tool_hooks=_UNSET, _prompt_options: PromptOptions | None = None,
+                  created_at=None, advance_head: bool = True, _display=None, _event_sink=None):
         if self._closed:
             raise RuntimeError('Agent 已关闭')
         if type(advance_head) is not bool:
             raise ValueError('advance_head 必须为布尔值')
+        if _prompt_options is not None and not isinstance(_prompt_options, PromptOptions):
+            raise TypeError('prompt_options 必须为 PromptOptions 实例或 None')
         running = asyncio.current_task()
         self._running.add(running)
         journal = None
@@ -239,10 +245,35 @@ class Agent:
             effective_guidance = self.guidance_factory if _guidance_factory is _UNSET else _guidance_factory
             if effective_guidance is not None and not callable(effective_guidance):
                 raise TypeError('guidance_factory 必须可调用或为 None')
+            effective_prompt_options = self.prompt_options if _prompt_options is None else _prompt_options
+            # 按已装配工具集合与继承工作区内容解析开关；后续动态追加的记忆工具不影响工作区与压缩判断。
+            has_nonempty_workspace = (
+                task.workspace != empty_workspace().model_dump(mode='json')
+                if task.workspace
+                else False
+            )
+            use_workspace, use_compaction = resolve_prompt_flags(
+                effective_prompt_options,
+                [entry.name for entry in entries],
+                has_nonempty_workspace=has_nonempty_workspace,
+            )
+            if effective_prompt_options.prompt_builder is not None:
+                prompt_builder = effective_prompt_options.prompt_builder
+            else:
+                prompt_builder = partial(
+                    build_system_prompt,
+                    role=_role or self.role,
+                    output_guidance=effective_prompt_options.output_guidance,
+                    include_interaction=effective_prompt_options.interaction,
+                    include_workspace=use_workspace,
+                    include_compaction=use_compaction,
+                    include_relative_time=effective_prompt_options.relative_time,
+                )
             core = AgentCore(self.settings, client=self.models.daily, counter=self.models.count_tokens,
                 options=self.options, registry=ToolRegistry(entries),
-                prompt_builder=partial(build_system_prompt, role=_role or self.role),
-                guidance_factory=effective_guidance)
+                prompt_builder=prompt_builder,
+                guidance_factory=effective_guidance,
+                include_workspace=use_workspace)
             if use_memory:
                 memory_cache_pool = create_memory_cache_pool(
                     capacity=self.options.memory_cache_max_queries,

@@ -42,7 +42,8 @@ class AgentCoreError(RuntimeError):
 class AgentCore:
     def __init__(self,settings,*,client=None,counter=None,options=None,registry=None,
                  system_prompt=_DEFAULT_PROMPT,prompt_builder=None,tool_call_template=None,
-                 guidance_factory: Callable[[CoreSettings], RequestGuidance] | None = None):
+                 guidance_factory: Callable[[CoreSettings], RequestGuidance] | None = None,
+                 include_workspace: bool = True):
         if system_prompt is not _DEFAULT_PROMPT and (not isinstance(system_prompt,str) or not system_prompt.strip()):
             raise ValueError('系统提示词不能为空')
         if prompt_builder is not None and (not callable(prompt_builder) or system_prompt is not _DEFAULT_PROMPT):
@@ -51,7 +52,10 @@ class AgentCore:
             raise TypeError('工具集合必须使用 ToolRegistry')
         if guidance_factory is not None and not callable(guidance_factory):
             raise TypeError("请求提示工厂必须可调用")
+        if type(include_workspace) is not bool:
+            raise ValueError('include_workspace 必须为布尔值')
         self.guidance_factory=guidance_factory
+        self.include_workspace=include_workspace
         self.settings=settings
         self.client=client
         self.counter=counter or self._count
@@ -72,6 +76,7 @@ class AgentCore:
             raise ValueError('系统提示词不能为空')
 
     def build_messages(self,request,**kwargs):
+        kwargs.setdefault('include_workspace',self.include_workspace)
         return build_messages(request,system_prompt=self.system_prompt,**kwargs)
 
     def with_registry(self,registry):
@@ -229,8 +234,10 @@ class AgentCore:
         generation=self.generation(request.thinking_effort)
         tools=self.registry.definitions()
         workspace=request.context.workspace.model_copy(deep=True)
-        # 每个新任务继承事实和规划，但当前任务必须准确对应本次用户原文。
-        workspace=workspace.model_copy(update={'task_constraints':workspace.task_constraints.model_copy(update={'task':request.question})})
+        if self.include_workspace:
+            # 启用工作区时，每个新任务继承事实和规划，并将当前任务准确对应本次用户原文；
+            # 未启用工作区时保持原快照不变，避免空工作区被隐式写入导致后续轮次误判为非空。
+            workspace=workspace.model_copy(update={'task_constraints':workspace.task_constraints.model_copy(update={'task':request.question})})
         accepted=[]
         all_exchanges=[]
         temporary=[]
@@ -371,7 +378,7 @@ class AgentCore:
                 if call.name=='compact_context':
                     summary_result,summary_size,summary_context=await compact(candidate,arguments.focus,'context_compaction',pending=pending)
                     candidate=summary_result.workspace
-                else:
+                elif self.include_workspace or call.name in WORKSPACE_TOOLS:
                     prospective=validate_count(await self.counter([{'role':'user','content':render_workspace_section(candidate)}],[],generation))
                     if call.name in WORKSPACE_TOOLS:
                         full=prospective>=workspace_budget

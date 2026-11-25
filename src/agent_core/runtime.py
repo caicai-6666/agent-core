@@ -1,5 +1,6 @@
 """面向业务调用方的树实例；共用一个执行器、驻留池和数据库连接池。"""
 from .agent import Agent
+from .core.prompt import PromptOptions
 from .core.tool import BaseTool, RegisteredTool, ToolRegistry, build_builtin_registrations
 from .core.tool.hooks import normalize_tool_hooks
 from .core.model import ContextInjection
@@ -60,11 +61,12 @@ class TreeAgent:
             raise SessionExpired('实例已关闭')
         session = self._session
         if self.persist_new_nodes:
-            # 公开句柄可长期持有，驱逐只释放驻留上下文。重新绑定时仍验证执行配置并保留提示工厂与工具钩子。
+            # 公开句柄可长期持有，驱逐只释放驻留上下文。重新绑定时仍验证执行配置并保留提示工厂、工具钩子与提示词选项。
             session = await self._runtime._restore_session(
                 session.runtime.agent, self.tree_id, session.role, session.tools, session.mode,
                 guidance_factory=session.guidance_factory,
                 tool_hooks=dict(session.tool_hooks) if session.tool_hooks else None,
+                prompt_options=session.prompt_options,
             )
             self._session = session
         return session
@@ -144,21 +146,23 @@ class AgentRuntime:
         return repo, tree.value
 
     async def _restore_session(self, engine, tree_id, role, tools, mode, heartbeat=None, *,
-                               guidance_factory=None, tool_hooks=None):
+                               guidance_factory=None, tool_hooks=None, prompt_options: PromptOptions | None = None):
         repo, tree = await self._metadata(engine,tree_id)
         if mode is None:
             policy = await repo.storage.read(repo.scope,'runtime_session')
             mode = policy.value['mode'] if policy else 'queue'
         return await engine.sessions._open(self._owner,tree_id,'persistent',mode,ContextInjection(),
             tools=tools,role=role,retention=tree.get('workspace_retention','per_node'),heartbeat=heartbeat,
-            guidance_factory=guidance_factory,tool_hooks=tool_hooks)
+            guidance_factory=guidance_factory,tool_hooks=tool_hooks,prompt_options=prompt_options)
 
     async def create(self, *, tree_id, role, database=None, tools=(), persist_new_nodes=True, execution_mode='queue',
                      workspace_retention='per_node', heartbeat: SchedulerSettings | None = None,
-                     guidance_factory=None, tool_hooks=None):
+                     guidance_factory=None, tool_hooks=None, prompt_options: PromptOptions | None = None):
         engine = self._engine_for(database)
         tools = _instance_tools(tools)
         _validate_instance_tool_hooks(tools, tool_hooks)
+        if prompt_options is not None and not isinstance(prompt_options, PromptOptions):
+            raise TypeError('prompt_options 必须为 PromptOptions 实例或 None')
         if not isinstance(role,str) or not role.strip() or type(persist_new_nodes) is not bool:
             raise ValueError('需要明确角色和布尔持久化选项')
         if workspace_retention not in ('per_node','latest'):
@@ -168,22 +172,25 @@ class AgentRuntime:
         owner = self._owner if persist_new_nodes else 'agent-core:memory'
         session = await engine.sessions._open(owner,tree_id,'persistent' if persist_new_nodes else 'memory',
             execution_mode,ContextInjection(),tools=tools,role=role,retention=workspace_retention,create=True,
-            heartbeat=heartbeat,guidance_factory=guidance_factory,tool_hooks=tool_hooks)
+            heartbeat=heartbeat,guidance_factory=guidance_factory,tool_hooks=tool_hooks,prompt_options=prompt_options)
         return TreeAgent(self,session,tree_id)
 
     async def restore(self, *, tree_id, role, database=None, tools=(), persist_new_nodes=True, execution_mode=None,
                       start_node_id=None, heartbeat: SchedulerSettings | None = None,
-                      guidance_factory=None, tool_hooks=None):
+                      guidance_factory=None, tool_hooks=None, prompt_options: PromptOptions | None = None):
         engine = self._engine_for(database)
         tools = _instance_tools(tools)
         _validate_instance_tool_hooks(tools, tool_hooks)
+        if prompt_options is not None and not isinstance(prompt_options, PromptOptions):
+            raise TypeError('prompt_options 必须为 PromptOptions 实例或 None')
         if not isinstance(role,str) or not role.strip() or type(persist_new_nodes) is not bool:
             raise ValueError('需要明确角色和布尔持久化选项')
         if persist_new_nodes:
             if start_node_id is not None:
                 raise ValueError('历史起点用于派生分身，持久实例恢复当前树头')
             session = await self._restore_session(engine,tree_id,role,tools,execution_mode,heartbeat,
-                                                  guidance_factory=guidance_factory,tool_hooks=tool_hooks)
+                                                  guidance_factory=guidance_factory,tool_hooks=tool_hooks,
+                                                  prompt_options=prompt_options)
         else:
             if heartbeat is not None:
                 raise ValueError('分身使用本体的心跳策略')
@@ -193,7 +200,8 @@ class AgentRuntime:
             node = tree['head'] if start_node_id is None else start_node_id
             context = await repo.context(node)
             session = await engine.sessions._open(self._owner,new_tree_id(),'fork','queue' if execution_mode is None else execution_mode,
-                context,reminders=repo,tools=tools,role=role,guidance_factory=guidance_factory,tool_hooks=tool_hooks)
+                context,reminders=repo,tools=tools,role=role,guidance_factory=guidance_factory,tool_hooks=tool_hooks,
+                prompt_options=prompt_options)
         return TreeAgent(self,session,tree_id)
 
     async def tree(self, tree_id: str, *, database=None, include_display: bool = True):

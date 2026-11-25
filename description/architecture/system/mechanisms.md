@@ -14,6 +14,7 @@
 | 主题规划、并行主题摘要、来源校验与合并 | `core/subgraph/context_management/topic_summary/` | 原实现，审计串行保存 |
 | 工作区压缩、待提交编辑保护 | `core/subgraph/context_management/workspace_compression/` | 原实现，候选验证后再提交 |
 | 原生工具对、私有推理与纠错轨迹隔离 | `core/native_messages.py`、`core/runtime.py` | 原实现，成功后清除临时失败 |
+| 模块化系统提示词装配与工作区消息按需卸载（`PromptOptions`） | `core/prompt/`、`core/context_rendering/messages.py`、`core/runtime.py`、`agent.py`、`sessions.py`、`runtime.py` | 按工具装配与工作区内容自动开关工作区协议、工作区 `user` 消息与 `compact_context` 指引；支持关闭交互/相对时间或传入自定义 `prompt_builder` |
 | 临时请求提示（开场提示与周期进展提醒） | `core/guidance.py`、`agent.py`、`sessions.py`、`runtime.py` | 仅附加到单次模型请求，不入历史或工作区；支持实例默认与单任务内存覆盖 |
 | Pydantic 参数、字段说明、工具独立顺序钩子（含 `with_hooks` 与 `tool_hooks`） | `core/tool/registry.py`、`hooks.py`、`agent.py`、`sessions.py`、`runtime.py` | 原实现；支持对全部静态与动态内置工具按名附加钩子，新业务钩子自动位于末尾 `FeedbackOnlyHook` 之前，展示与结构化结果分离 |
 | 工具执行期运行时上下文（`ContextVar`） | `core/tool/runtime_context.py`、`core/runtime.py`、`core/tool/file_search.py` | 执行边界内向组合工具暴露只读 `core`/`journal`/`thinking_effort`，支持静态装配子循环工具 |

@@ -1,5 +1,8 @@
 """沿用参考项目四区域定义和维护规则，容量行为与当前实现一致。"""
 
+_COMPACTION_SENTENCE_WITH_TOOL = '达到整理条件时，系统会受控整理；也可以通过 compact_context 主动整理当前有效历史和工作区。'
+_COMPACTION_SENTENCE_WITHOUT_TOOL = '达到整理条件时，系统会受控整理当前有效历史和工作区。'
+
 AGENT_CORE_WORKSPACE_PROMPT = """# 工作区定义与管理
 
 ## 1. 用途与边界
@@ -142,3 +145,16 @@ remaining_directions:
   direction_002:
     plan: 定位并比较两份合同的付款条件和逾期责任条款
 ```"""
+
+
+def build_agent_core_workspace_prompt(*, include_compaction: bool = True) -> str:
+    """返回工作区协议提示词；未启用 compact_context 时移除主动压缩工具引导。"""
+    if type(include_compaction) is not bool:
+        raise ValueError('include_compaction 必须为布尔值')
+    if include_compaction:
+        return AGENT_CORE_WORKSPACE_PROMPT
+    return AGENT_CORE_WORKSPACE_PROMPT.replace(
+        _COMPACTION_SENTENCE_WITH_TOOL,
+        _COMPACTION_SENTENCE_WITHOUT_TOOL,
+        1,
+    )

@@ -11,6 +11,7 @@ from time import monotonic
 from .adapters import SQLiteStorage
 from .core import AgentInput
 from .core.model import ContextInjection
+from .core.prompt import PromptOptions
 from .core.tool.hooks import normalize_tool_hooks
 from .model.question_tree import new_tree_id
 from .scheduler import Dispatch, Reminders, SchedulerSettings, utc_now
@@ -197,6 +198,7 @@ class Session:
         self.tools = tuple(tools)
         self.guidance_factory = None
         self.tool_hooks = ()
+        self.prompt_options = None
         self._scheduler = None
         self.managed_heartbeat = None
         self._reminder_repository = reminder_repository
@@ -395,7 +397,8 @@ class Session:
                 _display=recorder,
                 _repository=self.repository, _reminder_repository=self._reminder_repository, _session_tools=self.tools, _role=self.role,
                 **({'_guidance_factory': self.guidance_factory} if self.guidance_factory is not None else {}),
-                **({'_tool_hooks': dict(self.tool_hooks)} if self.tool_hooks else {}))
+                **({'_tool_hooks': dict(self.tool_hooks)} if self.tool_hooks else {}),
+                **({'_prompt_options': self.prompt_options} if self.prompt_options is not None else {}))
             await ticket.finish('completed', result=result, recorder=recorder)
             return result
         except asyncio.CancelledError:
@@ -625,7 +628,8 @@ class Session:
                         _repository=repo, _reminder_repository=self._reminder_repository, _session_tools=self.tools,
                         _control=self._active.control, _dispatch=dispatch, _role=self.role, created_at=item.get('created_at'),
                         **({'_guidance_factory': effective_guidance} if effective_guidance is not _UNSET else {}),
-                        **({'_tool_hooks': dict(self.tool_hooks)} if self.tool_hooks else {}))
+                        **({'_tool_hooks': dict(self.tool_hooks)} if self.tool_hooks else {}),
+                        **({'_prompt_options': self.prompt_options} if self.prompt_options is not None else {}))
                 except StorageConflict as error:
                     # 入队/领取竞争只在请求仍留队且确有版本竞争时重选；非竞争冲突（如历史工作区已释放）直接出队失败。
                     if not self._active.control.started:
@@ -772,11 +776,15 @@ class SessionRuntime:
             await self._release(session)
 
     async def _open(self, owner, identifier, kind, mode, baseline, reminders=None, tools=(), *, role=None,
-                    retention=None, create=False, heartbeat=None, guidance_factory=None, tool_hooks=None):
+                    retention=None, create=False, heartbeat=None, guidance_factory=None, tool_hooks=None,
+                    prompt_options: PromptOptions | None = None):
         if mode not in ('queue', 'interruptible') or not owner.strip() or not identifier.strip():
             raise ValueError('需要有效用户、会话标识和执行模式')
         if guidance_factory is not None and not callable(guidance_factory):
             raise TypeError('guidance_factory 必须可调用或为 None')
+        if prompt_options is not None and not isinstance(prompt_options, PromptOptions):
+            raise TypeError('prompt_options 必须为 PromptOptions 实例或 None')
+        effective_prompt_options = self.agent.prompt_options if prompt_options is None else prompt_options
         normalized_hooks = normalize_tool_hooks(tool_hooks)
         if heartbeat is not None:
             heartbeat = SchedulerSettings.model_validate(heartbeat)
@@ -792,7 +800,8 @@ class SessionRuntime:
                     raise StorageConflict('该树已存在')
                 if (existing.kind != kind or existing.mode != mode or existing.tools != tuple(tools)
                         or existing.role != role or existing.guidance_factory != guidance_factory
-                        or existing.tool_hooks != normalized_hooks):
+                        or existing.tool_hooks != normalized_hooks
+                        or existing.prompt_options != effective_prompt_options):
                     raise StorageConflict('同一会话已绑定其他形态或执行模式')
                 if heartbeat is not None and heartbeat != existing.managed_heartbeat:
                     raise StorageConflict('该树已绑定其他心跳策略')
@@ -816,6 +825,7 @@ class SessionRuntime:
             session.role = role
             session.guidance_factory = guidance_factory
             session.tool_hooks = normalized_hooks
+            session.prompt_options = effective_prompt_options
             if kind == 'persistent':
                 policy_value = {'mode': mode}
                 if heartbeat is not None:
@@ -858,20 +868,23 @@ class SessionRuntime:
                 self._maintenance = asyncio.create_task(self._maintain())
             return session
 
-    async def persistent(self, *, owner, tree_id, mode='queue', tools=(), guidance_factory=None, tool_hooks=None):
+    async def persistent(self, *, owner, tree_id, mode='queue', tools=(), guidance_factory=None, tool_hooks=None,
+                         prompt_options: PromptOptions | None = None):
         return await self._open(owner, tree_id, 'persistent', mode, ContextInjection(), tools=tools,
-                                guidance_factory=guidance_factory, tool_hooks=tool_hooks)
+                                guidance_factory=guidance_factory, tool_hooks=tool_hooks, prompt_options=prompt_options)
 
-    async def memory(self, *, owner, context=None, mode='queue', tools=(), guidance_factory=None, tool_hooks=None):
+    async def memory(self, *, owner, context=None, mode='queue', tools=(), guidance_factory=None, tool_hooks=None,
+                     prompt_options: PromptOptions | None = None):
         return await self._open(owner, new_tree_id(), 'memory', mode, context or ContextInjection(), tools=tools,
-                                guidance_factory=guidance_factory, tool_hooks=tool_hooks)
+                                guidance_factory=guidance_factory, tool_hooks=tool_hooks, prompt_options=prompt_options)
 
-    async def fork(self, parent, *, task_id=None, mode='queue', tools=(), guidance_factory=None, tool_hooks=None):
+    async def fork(self, parent, *, task_id=None, mode='queue', tools=(), guidance_factory=None, tool_hooks=None,
+                   prompt_options: PromptOptions | None = None):
         if parent.runtime is not self or parent.kind != 'persistent':
             raise ValueError('冻结分身必须绑定本运行时的持久会话')
         snapshot = await parent.snapshot(task_id)
         return await self._open(parent.owner, new_tree_id(), 'fork', mode, snapshot, self.agent.repository(parent.owner, parent.id),
-                                tools, guidance_factory=guidance_factory, tool_hooks=tool_hooks)
+                                tools, guidance_factory=guidance_factory, tool_hooks=tool_hooks, prompt_options=prompt_options)
 
     async def get(self, *, owner, session_id):
         async with self._lock:

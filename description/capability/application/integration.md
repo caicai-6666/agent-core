@@ -65,6 +65,7 @@ await database.close()
 - `created_at` 可传业务事件的带时区时间，用作模型的任务时间。省略时取提交时间。
 - `deferred=True` 登记任务后等待显式激活；宿主可在首次订阅时调用 `await job.activate()`。重启后恢复实例并调用 `await agent.activate(task_id)` 可重新获得句柄。等待激活的任务不会阻塞其他已就绪任务。`agent.redirect(task_id, instruction, deferred=True)` 同样支持延迟激活：会立即打断目标任务进入 `superseded`，同时将替代任务保持在 `pending_activation` 直到宿主调用 `activate()`。
 - `guidance_factory` 可在 `create`、`restore` 绑定会话默认临时请求提示策略（如 `ProgressGuidance.factory(interval_seconds=60.0)`），也可在 `generate(..., guidance_factory=...)` 按单任务覆盖或传 `None` 临时关闭。工厂为进程内 Python 回调，不写入持久队列 JSON；`ProgressGuidance.factory(...)` 支持按参数值比较相等，便于持久实例 `restore` 核对配置一致性，空闲驱逐后冷重绑自动保留原工厂。
+- `prompt_options`（`PromptOptions`，默认 `PromptOptions()`）可在 `Agent`、`AgentRuntime.create`、`AgentRuntime.restore`（含持久恢复与分身）及 `agent.sessions.*` 上控制主系统提示词与工作区上下文消息的模块化装配。默认 `workspace="auto"` 与 `compaction="auto"` 按当前实例实际装配的工具（及是否继承非空历史工作区）自动开关：未装配 `workspace_add` / `workspace_replace` / `workspace_delete` 且工作区为空时自动卸载工作区协议与工作区 `user` 消息，未装配 `compact_context` 时自动省略主动压缩指引；也可显式传入布尔值强制加载或强制卸载（包括在已有历史工作区的分身上设 `workspace=False`），或关闭 `interaction` / `relative_time`、追加 `output_guidance`、通过 `prompt_builder` 完全接管系统提示词构建。`PromptOptions` 不可变且按值比较，不写入树存储；驻留重开时核对一致性，持久实例空闲驱逐重绑时自动保留，分身可独立配置。
 - `tool_hooks` 可在 `Agent`、`AgentRuntime.create`、`AgentRuntime.restore`（含持久恢复与分身）及 `agent.sessions.*` 上按工具名称附加执行后钩子（`Mapping[str, Sequence[ToolHook]]`），适用于所有静态与动态装配的内置工具（包括 `workspace_*`、`compact_context`、`emit_progress`、`finish_task`、`search_memory`、`view_memory_query`、`*_reminder`、`*_file_note*`）以及自定义工具。注册表在装配时调用 `RegisteredTool.with_hooks(*hooks)`，将新增业务钩子插入已有业务钩子之后、末尾 `FeedbackOnlyHook` 之前，不破坏原注册项的不可变性与渲染契约；指定未启用或不存在的工具名立即抛出 `ValueError`。钩子为进程内回调，不写入树存储；持久实例空闲驱逐重绑时自动保留，驻留重开时核对一致性。为默认心跳 `finish_task` 附加业务钩子时仍保留安全静默裁剪：`ToolOperationFailed` 会阻断裁剪并向模型反馈原因，裁剪前置拒绝时跳过额外业务钩子。
 - `await agent.tree(include_display=True)` 与 `await runtime.tree(tree_id, database=None, include_display=True)` 返回只读 `TreeView`（含 `tree_id`、`head`、`active`、`workspace_retention` 及按创建顺序排列的全量 `TreeNode` 列表，覆盖主线与全部历史分支，不含工作区大对象与私有审计）。每个 `TreeNode` 携带 `started_at`、`finished_at`、`duration_ms` 计时字段（旧记录缺省为 `None`）；当 `include_display=True`（默认）时附带只读 `display: TaskDisplay | None`（含持久化的非 delta 公开 `events`、驻留活跃任务的内存实时 `streaming_messages` 前缀与 `last_sequence`），传 `include_display=False` 时省略以节省读取开销。`runtime.tree(...)` 无需预先装配角色或工具即可打开整棵树渲染，找不到树时抛出 `KeyError`。
 - `agent.recover(task_id)` 用于宿主确认旧执行进程已经停止后的故障收束。任务不会重放。
@@ -79,7 +80,7 @@ await database.close()
 | 日常模型 | `ChatProvider.create_chat_completion`、精确 token 计数器、生成预算 | 工具循环、内部检索规划、工作区与历史压缩、纠错 |
 | Embedding | `space_id`、`dimensions`、`embed(texts, purpose=...)` | 公开来源选择、统一 L2/float32 向量、来源复核、结果集 |
 | 数据库 | `Storage.read/atomic/index/search`，或直接用 `SQLiteStorage` | 任务树、父链、检查点、幂等、工作区版本、压缩窗口、恢复 |
-| 业务角色 | `role`：职责、规则、边界、输入输出与示例 | 追加统一工具交互和工作区协议 |
+| 业务角色 | `role`：职责、规则、边界、输入输出与示例 | 按 `PromptOptions` 模块化追加交互、压缩与工作区协议（未使用时自动卸载） |
 | 个性化工具 | `RegisteredTool` 或 `tool_factory(ToolContext)` | 参数 Schema 校验、独立钩子、权威提交与反馈消息 |
 
 两类模型（日常模型与 Embedding）都必须提供，即使暂时关闭记忆工具也不省略配置。各模型可以使用完全不同的服务。`RuntimeSettings` 不绑定 vLLM HTTP 协议；vLLM 由随包适配器提供。

@@ -19,14 +19,26 @@ def build_fixed_messages(request: AgentInput,*,system_prompt=SYSTEM_PROMPT):
     return [{'role':'system','content':system_prompt},{'role':'user','content':''}]
 
 
-def build_messages(request: AgentInput,*,workspace=None,summary=None,accepted=(),temporary=(),
-                   system_prompt=SYSTEM_PROMPT):
-    context=request.context
-    if summary is not None:context=context.model_copy(update={'summary':summary,'turns':[]})
-    messages=[{'role':'system','content':system_prompt},*render_history_messages(context),
-        {'role':'user','content':render_workspace_section(workspace or context.workspace)},
-        {'role':'user','content':render_current_input(request)}]
+def build_messages(
+    request: AgentInput,
+    *,
+    workspace=None,
+    summary=None,
+    accepted=(),
+    temporary=(),
+    system_prompt=SYSTEM_PROMPT,
+    include_workspace: bool = True,
+):
+    if type(include_workspace) is not bool:
+        raise ValueError('include_workspace 必须为布尔值')
+    context = request.context
+    if summary is not None:
+        context = context.model_copy(update={'summary': summary, 'turns': []})
+    messages = [{'role': 'system', 'content': system_prompt}, *render_history_messages(context)]
+    if include_workspace:
+        messages.append({'role': 'user', 'content': render_workspace_section(workspace or context.workspace)})
+    messages.append({'role': 'user', 'content': render_current_input(request)})
     # 已接受交互的 source 仅供宿主区分，不送给模型；失败反馈独立临时存在。
-    native=validate_native_messages(list(accepted))
-    messages.extend({key:value for key,value in message.items() if key!='source'} for message in native)
-    return deepcopy([*messages,*temporary])
+    native = validate_native_messages(list(accepted))
+    messages.extend({key: value for key, value in message.items() if key != 'source'} for message in native)
+    return deepcopy([*messages, *temporary])

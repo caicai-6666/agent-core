@@ -1,4 +1,4 @@
-from .core import AgentCore, AgentCoreError, AgentInput, AgentResult, CoreSettings, ProgressGuidance, RequestGuidance
+from .core import AgentCore, AgentCoreError, AgentInput, AgentResult, CoreSettings, ProgressGuidance, PromptOptions, RequestGuidance
 from .agent import Agent, AgentEvent, FinishTask, ToolContext
 from .providers import Models, RuntimeSettings, ChatProvider, EmbeddingProvider, OpenAIEmbedding
 from .storage import Storage, StorageConflict
