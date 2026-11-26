@@ -93,6 +93,7 @@ class TreeNode(BaseModel):
     started_at: AwareDatetime | None = None
     finished_at: AwareDatetime | None = None
     duration_ms: int | None = None
+    advance_head: bool = True
     outputs: list[tuple[str, str]] = Field(default_factory=list)
     output_ids: list[str] = Field(default_factory=list)
     summary: str = ''
@@ -244,6 +245,7 @@ class TaskRepository:
                 started_at=task.started_at,
                 finished_at=task.finished_at,
                 duration_ms=task.duration_ms,
+                advance_head=task.advance_head,
                 outputs=task.outputs,
                 output_ids=task.output_ids,
                 summary=summary,
