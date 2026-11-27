@@ -280,27 +280,29 @@ class Session:
                         or target.get('parent_id', 'latest') != item.get('parent_id', 'latest')
                         or target.get('advance_head', True) != item.get('advance_head', True)):
                     continue
+                # 命中最近一条同级且同来源的可合并候选后，若因任一上限不能合并，必须 break 另起新任务；
+                # 否则继续往前扫描会把新消息合并到更早的任务里，造成队列执行乱序。
                 target_count = target.get('merged_count', 1)
                 if merge_max_messages is not None and target_count >= merge_max_messages:
-                    continue
+                    break
                 if merge_interval_seconds is not None:
                     prev_raw = target.get('last_merged_at') or target.get('created_at')
                     new_raw = item.get('created_at')
                     if not prev_raw or not new_raw:
-                        continue
+                        break
                     delta = (datetime.fromisoformat(new_raw) - datetime.fromisoformat(prev_raw)).total_seconds()
                     # 时钟回拨（delta < 0）或超过窗口上限时不再合并。
                     if delta < 0 or delta > merge_interval_seconds:
-                        continue
+                        break
                 combined_question = target['question'] + merge_separator + item['question']
                 if merge_max_bytes is not None and len(combined_question.encode('utf-8')) > merge_max_bytes:
-                    continue
+                    break
                 attachments = {ref['file_id']: ref for ref in target['attachments']}
                 for ref in item['attachments']:
                     if attachments.setdefault(ref['file_id'], ref) != ref:
                         raise ValueError('同一附件在合并任务中声明了不同类型')
                 if merge_max_attachments is not None and len(attachments) > merge_max_attachments:
-                    continue
+                    break
                 # 保序去重 supplemental，兼容不含 supplemental_parts 的历史队列项。
                 existing_parts = target.get('supplemental_parts')
                 if existing_parts is None:
