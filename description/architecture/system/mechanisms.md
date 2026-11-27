@@ -21,7 +21,8 @@
 | 工具结果对象缓存池、权限受限句柄与事务提交 | `core/tool/cache.py`、`registry.py` | 可选声明，按 `task`/`session` 作用域隔离 LRU，提交确认后落池 |
 | 事务前检查点、提交后回调、幂等任务 | `tasks.py`、`storage.py` | 库拥有状态机，底层数据库只提供 CAS |
 | 任务父链、持久化分支、全量树视图、工作区版本、节点计时与摘要重启恢复 | `tasks.py`、`sessions.py`、`runtime.py` | 支持 `parent_id` 历史分支/新根、`advance_head=False` 旁路探索、节点单调计时（`started_at`/`finished_at`/`duration_ms`）、`redirect(..., deferred=True)` 与 `TreeView`/`TreeNode` 只读全量视图，库内统一不委托消费者重写 |
-| 用户/树隔离、执行中断恢复 | `agent.py`、`tasks.py` | 绑定可信作用域，不自动重放外部副作用 |
+| 用户/树隔离、执行租约与自动故障恢复 | `agent.py`、`tasks.py`、`sessions.py`、`scheduler.py`、`runtime.py` | 绑定可信作用域与 `active_lease` 租约续期/失租防脑裂；支持租约过期自动僵尸收束、残留展示流收尾、心跳 `heartbeat_pending` 联动清理与可选零副作用重入队，默认不重放外部副作用 |
+| 持久化队列合并、毒丸隔离、重启恢复与优雅停机 | `sessions.py`、`runtime.py`、`agent.py` | 支持可配置分隔符（默认 `\n\n---\n\n`）、同源隔离、`supplemental` 保序去重与多维合并上限；前置确定性错误隔离为 `runtime_rejected:<id>`；提供无状态 `queue_status()`、`resume()` 与 `close(graceful=True, timeout=...)` |
 | 公开消息记忆、统一向量、混合召回和来源复核 | `memory.py`、`vectors.py` | 数据库可替换，来源语义固定 |
 | 检索子 Agent、LRU 分页、签名资料、页面折叠与 `CachePool` 集成 | `core/subgraph/memory_retrieval/`、`core/tool/memory_search.py`、`core/tool/memory_viewer.py`、`core/page_display.py` | 共享 `scope='task'` `CachePool` 存放结果集，正文持续回查权威父链 |
 | 通用 PDF 逐页查看、视觉预算与 `CachePool` 集成 | `core/file/pdf.py`、`core/file/pdf_viewer.py`、`core/tool/pdf_viewer.py` | 按需安装 `agent-core[pdf]`，任意 `file_id`、授权复核与自动关闭驱逐 |

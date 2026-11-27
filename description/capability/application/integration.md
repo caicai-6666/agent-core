@@ -58,17 +58,21 @@ await database.close()
 - `priority` 是整数，数值越大越早被领取。
 - `parent_id` 默认为 `"latest"`（继承当前 `head`）；传入指定已提交节点的 32 位小写十六进制任务 ID 可在同树内持久化创建历史分支，传入 `None` 可在同树内创建新根节点。`workspace_retention="latest"` 下历史节点的工作区已释放，从非当前 `head` 分支会以 `StorageConflict` 结束该任务；指定不存在的 `parent_id` 会以 `KeyError` 结束该任务，均自动出队而不阻塞后续任务。`redirect`（即 `replace_task_id`）不能与非 `"latest"` 的 `parent_id` 同时使用。
 - `advance_head` 默认为 `True`（任务终态推进 `tree.head`）。传入 `advance_head=False` 可在不改变当前主线 `tree.head` 的前提下创建持久化旁路分支，后续默认 `generate()` 仍沿原主线 `head` 继续。`workspace_retention="latest"` 模式禁止 `advance_head=False`（抛出 `StorageConflict`）。对 `advance_head=False` 的在途任务执行 `redirect` 且未显式指定 `advance_head` 时，替代任务自动以被替代节点为父节点并沿用 `advance_head=False`。
-- `await agent.generate("补充交付日期", priority=10, merge_with_previous=True)` 会追加到最近入队、同优先级、同 `parent_id`、同 `advance_head` 且已就绪的普通等待任务。目标保留原任务 ID 和排队位置，两次提交共享执行结果；同一驻留实例也共享事件流。默认每次提交创建独立任务。没有符合条件的目标时按普通任务入队。
-- 合并按入队事务提交顺序保留每段 prompt 和补充上下文，附件按文件 ID 去重。任务来源、创建时间和推理档位沿用目标任务；任何一次输入关闭预览时，该任务关闭预览。待激活输入和定向替代输入不能同时请求合并。在途任务、到期提醒和空闲心跳均不作为合并目标。
+- `await agent.generate("补充交付日期", priority=10, merge_with_previous=True)` 会追加到最近入队、同来源（`source` 相同，不跨 `"user"` 与 `"business"` 合并）、同优先级、同 `parent_id`、同 `advance_head` 且已就绪的普通等待任务。目标保留原任务 ID 和排队位置，两次提交共享执行结果；同一驻留实例也共享事件流。默认每次提交创建独立任务；没有符合条件的目标时按普通任务入队。
+- 合并默认使用 `merge_separator="\n\n---\n\n"` 拼接每段 prompt（可自定义字符串），按入队事务提交顺序保留 `supplemental` 并保序去重（重复文本仅保留一份，兼容不含 `supplemental_parts` 的旧队列项），附件按文件 ID 去重。可通过可选参数控制单目标合并上限：`merge_max_messages`（最大合并条数）、`merge_max_bytes`（合并后 UTF-8 字节上限；单条自身超限仍可独立入队）、`merge_max_attachments`（去重后附件数上限）、`merge_interval_seconds`（距上次合并间隔秒数上限，时钟回拨即负时间差同样触发拆分）。任一上限超限时跳过目标并创建新任务。任务来源、创建时间和推理档位沿用目标任务；任何一次输入关闭预览时，该任务关闭预览。待激活输入和定向替代输入不能同时请求合并。在途任务、到期提醒和空闲心跳均不作为合并目标。
 - 合并和领取使用同一队列版本校验。目标被抢先领取时重新选择，合并收据与队列更新在同一事务提交。`external_id` 重投返回原任务 ID，每段输入只追加一次。
-- `external_id` 在本实例的任务作用域内去重；相同输入并发投递共用任务 ID，冲突输入报错。仅当 `parent_id != "latest"` 或 `advance_head=False` 时才将对应字段纳入指纹，默认请求的既有 `external_id` 指纹保持向后兼容。持久树的收据跨重启保留。使用 `latest` 时较早的任务仍有收据，完整结果回读遵循历史工作区保留策略。
+- `external_id` 在本实例的任务作用域内去重；相同输入并发投递共用任务 ID，冲突输入报错。仅当 `parent_id != "latest"`、`advance_head=False` 或合并策略参数偏离默认值（自定义 `merge_separator` 或设置任一 `merge_max_*`/`merge_interval_seconds` 上限）时才将对应字段纳入指纹，默认请求的既有 `external_id` 指纹保持向后兼容。持久树的收据跨重启保留。使用 `latest` 时较早的任务仍有收据，完整结果回读遵循历史工作区保留策略。
 - `created_at` 可传业务事件的带时区时间，用作模型的任务时间。省略时取提交时间。
 - `deferred=True` 登记任务后等待显式激活；宿主可在首次订阅时调用 `await job.activate()`。重启后恢复实例并调用 `await agent.activate(task_id)` 可重新获得句柄。等待激活的任务不会阻塞其他已就绪任务。`agent.redirect(task_id, instruction, deferred=True)` 同样支持延迟激活：会立即打断目标任务进入 `superseded`，同时将替代任务保持在 `pending_activation` 直到宿主调用 `activate()`。
 - `guidance_factory` 可在 `create`、`restore` 绑定会话默认临时请求提示策略（如 `ProgressGuidance.factory(interval_seconds=60.0)`），也可在 `generate(..., guidance_factory=...)` 按单任务覆盖或传 `None` 临时关闭。工厂为进程内 Python 回调，不写入持久队列 JSON；`ProgressGuidance.factory(...)` 支持按参数值比较相等，便于持久实例 `restore` 核对配置一致性，空闲驱逐后冷重绑自动保留原工厂。
 - `prompt_options`（`PromptOptions`，默认 `PromptOptions()`）可在 `Agent`、`AgentRuntime.create`、`AgentRuntime.restore`（含持久恢复与分身）及 `agent.sessions.*` 上控制主系统提示词与工作区上下文消息的模块化装配。默认 `workspace="auto"` 与 `compaction="auto"` 按当前实例实际装配的工具（及是否继承非空历史工作区）自动开关：未装配 `workspace_add` / `workspace_replace` / `workspace_delete` 且工作区为空时自动卸载工作区协议与工作区 `user` 消息，未装配 `compact_context` 时自动省略主动压缩指引；也可显式传入布尔值强制加载或强制卸载（包括在已有历史工作区的分身上设 `workspace=False`），或关闭 `interaction` / `relative_time`、追加 `output_guidance`、通过 `prompt_builder` 完全接管系统提示词构建。`PromptOptions` 不可变且按值比较，不写入树存储；驻留重开时核对一致性，持久实例空闲驱逐重绑时自动保留，分身可独立配置。
 - `tool_hooks` 可在 `Agent`、`AgentRuntime.create`、`AgentRuntime.restore`（含持久恢复与分身）及 `agent.sessions.*` 上按工具名称附加执行后钩子（`Mapping[str, Sequence[ToolHook]]`），适用于所有静态与动态装配的内置工具（包括 `workspace_*`、`compact_context`、`emit_progress`、`finish_task`、`search_memory`、`view_memory_query`、`*_reminder`、`*_file_note*`）以及自定义工具。注册表在装配时调用 `RegisteredTool.with_hooks(*hooks)`，将新增业务钩子插入已有业务钩子之后、末尾 `FeedbackOnlyHook` 之前，不破坏原注册项的不可变性与渲染契约；指定未启用或不存在的工具名立即抛出 `ValueError`。钩子为进程内回调，不写入树存储；持久实例空闲驱逐重绑时自动保留，驻留重开时核对一致性。为默认心跳 `finish_task` 附加业务钩子时仍保留安全静默裁剪：`ToolOperationFailed` 会阻断裁剪并向模型反馈原因，裁剪前置拒绝时跳过额外业务钩子。
 - `await agent.tree(include_display=True)` 与 `await runtime.tree(tree_id, database=None, include_display=True)` 返回只读 `TreeView`（含 `tree_id`、`head`、`active`、`workspace_retention` 及按创建顺序排列的全量 `TreeNode` 列表，覆盖主线与全部历史分支，不含工作区大对象与私有审计）。每个 `TreeNode` 携带 `started_at`、`finished_at`、`duration_ms` 计时字段（旧记录缺省为 `None`）与 `advance_head` 标记（旧记录缺省为 `True`，用于区分主干推进与旁路分支，包括在途 `generating` 节点）；当 `include_display=True`（默认）时附带只读 `display: TaskDisplay | None`（含持久化的非 delta 公开 `events`、驻留活跃任务的内存实时 `streaming_messages` 前缀与 `last_sequence`），传 `include_display=False` 时省略以节省读取开销。`runtime.tree(...)` 无需预先装配角色或工具即可打开整棵树渲染，找不到树时抛出 `KeyError`。
-- `agent.recover(task_id)` 用于宿主确认旧执行进程已经停止后的故障收束。任务不会重放。
+- `AgentRuntime(..., lease_seconds=300.0)` 与 `Agent(..., lease_seconds=300.0)` 为每个运行实例分配唯一 `owner_id` 并维护执行租约（`active_lease`）：任务运行期间后台每 `lease_seconds / 3` 自动 CAS 续租，若检测到租约被外部接管或丢失则立即中断并取消本任务以防脑裂；任务终态、裁剪或恢复时同事务释放租约。
+- `await runtime.queue_status(tree_id, database=None) -> QueueStatus` 无状态只读查询指定树的 `ready_count`、`deferred_count`、`active_task_id`、`lease_owner_id`、`lease_expires_at` 与 `lease_expired`，**不创建驻留会话也不占用 `capacity`**，适合重启扫描与监控巡检；树不存在时抛出 `KeyError`。
+- `await agent.resume(recover_expired=True, recover_unleased=False) -> ResumeResult`（对应底层 `session.resume(...)`）幂等执行重启恢复：先按需收束过期在途任务，再统计就绪队列并唤醒后台消费，返回 `ResumeResult(recovered_task_id, queued_count, draining)`。
+- `await agent.recover_stale(now=None, status="failed", recover_unleased=False, stale_owner_ids=None, requeue_if_unstarted=False)` 委托 `TaskRepository.recover_expired_active(...)` 按租约过期状态或已知失效 `owner_id` 自动收束僵尸任务（绝不抢占健康租约）；默认遵循不重放原则，仅当显式传入 `requeue_if_unstarted=True` 且该任务严格零副作用（无检查点、无公开输出、无工具结果）且来源为 `"user"`/`"business"` 时才在同事务重新入队。`agent.recover(task_id)` 继续用于宿主人工确认旧执行进程已停止后的显式收束。
+- `await runtime.close(graceful=True, timeout=30.0)`（以及 `await agent.close(graceful=True, timeout=30.0)`）支持优雅停机：先停止各驻留会话与调度器继续领取新任务（完好保留持久 `runtime_queue`），最多等待 `timeout` 秒让当前在途单任务自然收尾；超时仍未结束则主动中断并取消在途任务，使其通过 `journal.abort("cancelled")` 立即释放 `tree.active` 与 `active_lease`，本地未完成句柄标记为 `SessionExpired`，新进程重启后调用 `restore()` + `resume()` 即可无缝接续剩余队列。默认 `graceful=False` 保持严格校验（存在排队或执行中任务时抛出 `StorageConflict`）。
 - 新接口使用数据库内固定的树命名空间。接续旧 `Agent` 创建的树时，用 `AgentRuntime(..., legacy_owner=原owner)` 绑定其原有命名空间；原数据库的执行模式与工作区策略继续有效。拥有同名树的多个旧 owner 应分别绑定。
 
 ---
@@ -199,7 +203,12 @@ async with aclosing(agent.stream("任务", owner=user_id, tree_id=tree_id)) as e
 
 ## 故障与恢复
 
-先用 `agent.repository(owner, tree_id).load(task_id)` 查看权威状态。进程崩溃后，确认旧执行器已停止，再调用 `agent.recover(...)` 将在途任务转为失败并释放树；用户已取消或调整方向时可明确指定 `status="cancelled"` 或 `status="superseded"`，保留相应终态语义。库保留已提交轨迹和私有审计，不自动重放可能已执行的工具。
+先用 `await runtime.queue_status(tree_id)` 或 `agent.repository(owner, tree_id).load(task_id)` 查看权威状态与租约是否过期。进程崩溃后：
+
+- **租约自动恢复**：租约过期后，新进程在 `await agent.resume()`、`await agent.recover_stale()`、`Session._drain()` 节流巡检或 `AgentScheduler._tick()` 中均可自动通过 `recover_expired_active()` 收束僵尸任务、关闭残留 `display:<task_id>` 流式消息并释放 `tree.active` 与 `active_lease`，随后自动继续消费持久队列。升级前遗留的无租约僵尸可通过 `recover_unleased=True` 显式接管；已知下线实例的 `owner_id` 可通过 `stale_owner_ids` 提前收束。
+- **心跳僵尸联动**：若过期的在途任务来源为 `"heartbeat"`，`recover_expired_active()` 会在同一事务内一并清除 `heartbeat.heartbeat_pending` 而不推进 `last_heartbeat_at`，避免后续心跳永久卡死。
+- **人工收束与不重放边界**：宿主确认旧执行器已停止时也可直接调用 `agent.recover(...)` 指定 `"failed"`、`"cancelled"` 或 `"superseded"`。库默认保留已提交轨迹和私有审计，不自动重放可能已执行的工具；仅在显式开启 `requeue_if_unstarted=True` 且任务尚未产生任何检查点、输出或工具结果时才允许重入队。
+- **优雅停机与重启续跑**：滚动发布前调用 `await runtime.close(graceful=True, timeout=...)` 保留未消费队列并及时释放执行权，重启后通过 `queue_status()` 筛选有待处理任务的树，再按需 `restore()` + `resume()` 恢复消费。
 
 新任务将读取已确认的工作区、完整历史、终态语义和压缩窗口。需要继续业务时创建后续任务，并在涉及外部写操作前核实未确认动作的实际状态。幂等任务 ID 不等于任意外部工具自动具备 exactly-once 语义。
 
@@ -276,7 +285,7 @@ async for event in replacement.events():
 
 Agent 的 `session_capacity` 默认 100，`session_ttl_seconds` 默认 1800。运行时自动清理空闲会话；达到容量上限时先驱逐最久未用的空闲会话，全部活跃则返回冲突。执行、排队与快照读取期间保护对应会话。宿主也可显式 `await agent.sessions.release(session)`。使用 `await agent.sessions.get(owner=..., session_id=...)` 续接驻留会话，内存会话和分身释放后返回 `SessionExpired`。
 
-同一会话的提交、SSE 与停止请求应路由到同一运行进程。任务领取依赖数据库版本校验；跨进程竞争后本地句柄可以回查持久终态，实时分片与取消信号由执行进程持有。持久会话重新绑定会继续未领取的队列，崩溃遗留的活动任务须确认旧执行器停止后走 `agent.recover()`。内存会话的队列随进程结束。需要排队和打断时使用 `session.submit()`；原有直接调用 `agent.run()` 的忙时冲突语义保留。
+同一会话的提交、SSE 与停止请求应路由到同一运行进程。任务领取依赖数据库版本校验；跨进程竞争后本地句柄可以回查持久终态，实时分片与取消信号由执行进程持有。优雅下线时应调用 `await agent.close(graceful=True, timeout=...)`（或 `await runtime.close(graceful=True, timeout=...)`）保留未消费队列并及时释放执行权；持久会话重新绑定后可调用 `await session.resume()` 恢复消费并按租约自动收束过期僵尸任务，或先通过 `await runtime.queue_status(tree_id)` 无状态巡检。内存会话的队列随进程结束。需要排队和打断时使用 `session.submit()`；原有直接调用 `agent.run()` 的忙时冲突语义保留。
 
 ---
 

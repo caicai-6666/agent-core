@@ -1,5 +1,6 @@
 """个人助理的到期提醒与空闲心跳，按可信任务树隔离。"""
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 import logging
@@ -121,7 +122,13 @@ class AgentScheduler:
             await Reminders(repo).materialize_due(now)
         tree = await repo.storage.read(repo.scope, 'tree')
         if tree and tree.value['active']:
-            return
+            # 在途任务租约已过期时自动收束并释放执行权，随后重读树状态继续本轮检查。
+            recovered = await repo.recover_expired_active()
+            if recovered is None:
+                return
+            tree = await repo.storage.read(repo.scope, 'tree')
+            if tree and tree.value['active']:
+                return
         queued = await repo.storage.read(repo.scope, 'runtime_queue')
         if queued and any(not item.get('deferred') for item in queued.value['items']):
             return
@@ -209,7 +216,8 @@ class AgentScheduler:
     async def close(self):
         self._stop.set()
         if self._worker is not None:
-            await self._worker
+            with suppress(asyncio.CancelledError):
+                await self._worker
         key = (self.owner, self.tree_id)
         if self.agent._schedulers.get(key) is self:
             del self.agent._schedulers[key]

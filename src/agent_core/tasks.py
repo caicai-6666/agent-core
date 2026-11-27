@@ -2,7 +2,8 @@
 import hashlib
 import json
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from math import isfinite
 from time import monotonic
 from typing import Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
@@ -111,6 +112,32 @@ class TreeView(BaseModel):
     active: str | None
     workspace_retention: str
     nodes: list[TreeNode] = Field(default_factory=list)
+
+
+def validate_lease_seconds(lease_seconds) -> float:
+    """校验租约时长必须为有限正数且不为布尔值。"""
+    if (isinstance(lease_seconds, bool) or not isinstance(lease_seconds, (int, float))
+            or not isfinite(lease_seconds) or lease_seconds <= 0):
+        raise ValueError('lease_seconds 必须为有限正数')
+    return float(lease_seconds)
+
+
+def _empty_lease(now: datetime) -> dict:
+    return {
+        'task_id': None,
+        'owner_id': None,
+        'expires_at': None,
+        'updated_at': now.isoformat(),
+    }
+
+
+def _active_lease(task_id: str, owner_id: str, lease_seconds: float, now: datetime) -> dict:
+    return {
+        'task_id': task_id,
+        'owner_id': owner_id,
+        'expires_at': (now + timedelta(seconds=lease_seconds)).isoformat(),
+        'updated_at': now.isoformat(),
+    }
 
 
 class TaskRepository:
@@ -263,11 +290,15 @@ class TaskRepository:
         )
 
     async def begin(self, request: AgentInput, *, task_id=None, parent_id='latest', dispatch=None,
-                    advance_head: bool = True):
+                    advance_head: bool = True, owner_id: str | None = None, lease_seconds: float | None = None):
         if type(advance_head) is not bool:
             raise ValueError('advance_head 必须为布尔值')
         if not advance_head and self.workspace_retention == 'latest':
             raise StorageConflict('workspace_retention=latest 模式下不允许 advance_head=False')
+        if owner_id is not None and (not isinstance(owner_id, str) or not owner_id.strip()):
+            raise ValueError('owner_id 必须为非空字符串')
+        if lease_seconds is not None:
+            lease_seconds = validate_lease_seconds(lease_seconds)
         task_id = task_id or new_tree_id()
         if len(task_id) != 32 or any(c not in '0123456789abcdef' for c in task_id):
             raise ValueError('任务 ID 必须为 32 位小写十六进制 UUID')
@@ -288,18 +319,55 @@ class TaskRepository:
             raise StorageConflict('该心跳已完成裁剪，不能重放')
         if state['active'] is not None:
             raise StorageConflict('该树已有在途任务；等待完成或确认旧执行器停止后恢复')
+        lease_rec = await self.storage.read(self.scope, 'active_lease')
+        if lease_rec is not None and lease_rec.value.get('task_id') is not None:
+            raise StorageConflict('该树已有活动租约；等待完成或恢复后再启动新任务')
         parent_id = state['head'] if parent_id == 'latest' else parent_id
         context = await self.context(parent_id)
+        now = datetime.now(timezone.utc)
         task = Task(id=task_id, source=request.source, parent_id=parent_id, question=request.question,
-            created_at=request.created_at, started_at=datetime.now(timezone.utc),
+            created_at=request.created_at, started_at=now,
             advance_head=advance_head,
             attachments=[a.model_dump() for a in request.attachments],
             workspace=context.workspace.model_dump(mode='json'))
         state['active'] = task.id
         state['tasks'].append(task.id)
-        await self.storage.atomic(self.scope, [Write('tree', tree.version if tree else None, state),
-            Write('task:' + task.id, None, task.model_dump(mode='json')), *(dispatch.writes if dispatch else ())])
+        writes = [
+            Write('tree', tree.version if tree else None, state),
+            Write('task:' + task.id, None, task.model_dump(mode='json')),
+        ]
+        if owner_id is not None and lease_seconds is not None:
+            # 租约与 tree.active 同事务写入，防止双写或半创建状态。
+            writes.append(Write(
+                'active_lease',
+                lease_rec.version if lease_rec else None,
+                _active_lease(task.id, owner_id, lease_seconds, now),
+            ))
+        writes.extend(dispatch.writes if dispatch else ())
+        await self.storage.atomic(self.scope, writes)
         return task, 1, True
+
+    async def renew_lease(self, task_id: str, owner_id: str, lease_seconds: float, *, now: datetime | None = None) -> bool:
+        """CAS 续租当前活动任务；若租约已失配、过期或被并发修改则返回 False。"""
+        lease_seconds = validate_lease_seconds(lease_seconds)
+        if now is not None and now.tzinfo is None:
+            raise ValueError('now 必须包含时区信息')
+        current_time = now if now is not None else datetime.now(timezone.utc)
+        lease_rec = await self.storage.read(self.scope, 'active_lease')
+        if lease_rec is None:
+            return False
+        value = lease_rec.value
+        if value.get('task_id') != task_id or value.get('owner_id') != owner_id:
+            return False
+        expires_raw = value.get('expires_at')
+        if not expires_raw or datetime.fromisoformat(expires_raw) <= current_time:
+            return False
+        updated = _active_lease(task_id, owner_id, lease_seconds, current_time)
+        try:
+            await self.storage.atomic(self.scope, [Write('active_lease', lease_rec.version, updated)])
+            return True
+        except StorageConflict:
+            return False
 
     async def save(self, task, version, *, extra=()):
         data = task.model_dump(mode='json')
@@ -321,6 +389,9 @@ class TaskRepository:
                 new_head = task.id if task.advance_head else state['head']
                 state = {**state, 'active': None, 'head': new_head}
                 writes.append(Write('tree', tree.version, state))
+                lease_rec = await self.storage.read(self.scope, 'active_lease')
+                if lease_rec is not None:
+                    writes.append(Write('active_lease', lease_rec.version, _empty_lease(datetime.now(timezone.utc))))
         writes.append(Write('task:' + task.id, version, data))
         await self.storage.atomic(self.scope, writes)
         return version + 1
@@ -343,6 +414,37 @@ class TaskRepository:
                 # 与其他确认者竞争时只回查确认记录，绝不重放模型或工具。
                 continue
 
+    async def _recovery_display_write(self, task_id: str, status: str) -> Write | None:
+        """构造故障恢复时的展示日志收束写集：结束残留流式消息并追加终态事件。"""
+        display_key = 'display:' + task_id
+        display_rec = await self.storage.read(self.scope, display_key)
+        if display_rec is None:
+            return None
+        display = TaskDisplay.model_validate(display_rec.value)
+        events = list(display.events)
+        seq = display.last_sequence
+        for msg in display.streaming_messages:
+            seq += 1
+            events.append(DisplayEvent(
+                sequence=seq,
+                type='message.completed',
+                data={
+                    'message_id': msg.message_id,
+                    'message_kind': msg.message_kind,
+                    'text': msg.text,
+                    'status': 'interrupted',
+                    'task_id': task_id,
+                },
+            ))
+        seq += 1
+        events.append(DisplayEvent(
+            sequence=seq,
+            type='task.' + status,
+            data={'task_id': task_id},
+        ))
+        final_display = TaskDisplay(events=events, streaming_messages=[], last_sequence=seq)
+        return Write(display_key, display_rec.version, final_display.model_dump(mode='json'))
+
     async def recover(self, task_id, *, status="failed"):
         """只有宿主确认旧进程停止后调用；保留已提交动作，不重放未知副作用。"""
         if status not in ("failed", "cancelled", "superseded"):
@@ -355,36 +457,129 @@ class TaskRepository:
             if task.started_at is not None:
                 task.duration_ms = max(0, int((now - task.started_at).total_seconds() * 1000))
             extra = []
-            display_key = 'display:' + task.id
-            display_rec = await self.storage.read(self.scope, display_key)
-            if display_rec is not None:
-                # 崩溃恢复时一并收束残留流式消息并追加终态展示事件，与任务终态同事务落库。
-                display = TaskDisplay.model_validate(display_rec.value)
-                events = list(display.events)
-                seq = display.last_sequence
-                for msg in display.streaming_messages:
-                    seq += 1
-                    events.append(DisplayEvent(
-                        sequence=seq,
-                        type='message.completed',
-                        data={
-                            'message_id': msg.message_id,
-                            'message_kind': msg.message_kind,
-                            'text': msg.text,
-                            'status': 'interrupted',
-                            'task_id': task.id,
-                        },
-                    ))
-                seq += 1
-                events.append(DisplayEvent(
-                    sequence=seq,
-                    type='task.' + status,
-                    data={'task_id': task.id},
-                ))
-                final_display = TaskDisplay(events=events, streaming_messages=[], last_sequence=seq)
-                extra.append(Write(display_key, display_rec.version, final_display.model_dump(mode='json')))
+            # 崩溃恢复时一并收束残留流式消息并追加终态展示事件，与任务终态同事务落库。
+            display_write = await self._recovery_display_write(task.id, status)
+            if display_write is not None:
+                extra.append(display_write)
             await self.save(task, version, extra=extra)
         return task
+
+    async def recover_expired_active(
+        self,
+        *,
+        now: datetime | None = None,
+        status: Literal['failed', 'cancelled', 'superseded'] = 'failed',
+        recover_unleased: bool = False,
+        stale_owner_ids: set[str] | None = None,
+        requeue_if_unstarted: bool = False,
+    ) -> Task | None:
+        """按租约状态自动收束过期或已知失效持有者的在途任务；绝不抢占健康租约。"""
+        if status not in ('failed', 'cancelled', 'superseded'):
+            raise ValueError('恢复终态仅允许失败、取消或用户调整方向')
+        if type(recover_unleased) is not bool:
+            raise ValueError('recover_unleased 必须为布尔值')
+        if type(requeue_if_unstarted) is not bool:
+            raise ValueError('requeue_if_unstarted 必须为布尔值')
+        if stale_owner_ids is not None and (
+            not isinstance(stale_owner_ids, (set, frozenset))
+            or any(not isinstance(o, str) or not o.strip() for o in stale_owner_ids)
+        ):
+            raise ValueError('stale_owner_ids 必须为非空字符串集合或 None')
+        if now is not None and now.tzinfo is None:
+            raise ValueError('now 必须包含时区信息')
+
+        while True:
+            current_time = now if now is not None else datetime.now(timezone.utc)
+            tree_rec = await self.storage.read(self.scope, 'tree')
+            if tree_rec is None or tree_rec.value.get('active') is None:
+                return None
+            state = self._tree_state(tree_rec)
+            active_id = state['active']
+            lease_rec = await self.storage.read(self.scope, 'active_lease')
+            lease_val = lease_rec.value if lease_rec is not None else None
+            if lease_val is not None and lease_val.get('task_id') == active_id:
+                expires_raw = lease_val.get('expires_at')
+                owner_id = lease_val.get('owner_id')
+                expired = expires_raw is None or datetime.fromisoformat(expires_raw) <= current_time
+                stale_owner = bool(stale_owner_ids and owner_id in stale_owner_ids)
+                if not expired and not stale_owner:
+                    # 活动租约仍健康，严禁抢占。
+                    return None
+            elif lease_val is None or lease_val.get('task_id') is None:
+                if not recover_unleased:
+                    return None
+            else:
+                if not recover_unleased:
+                    return None
+
+            task, task_version = await self.load(active_id)
+            if task.status != 'generating':
+                return None
+            task.status = status
+            task.finished_at = current_time
+            if task.started_at is not None:
+                task.duration_ms = max(0, int((current_time - task.started_at).total_seconds() * 1000))
+
+            task_data = task.model_dump(mode='json')
+            writes: list[Write] = []
+            if self.workspace_retention == 'latest':
+                task_data['workspace'] = None
+                if task_data['result'] is not None:
+                    task_data['result'].pop('workspace', None)
+                latest = await self.storage.read(self.scope, 'workspace:latest')
+                writes.append(Write('workspace:latest', latest.version if latest else None,
+                                    {'task_id': task.id, 'workspace': task.workspace}))
+
+            new_head = task.id if task.advance_head else state['head']
+            writes.append(Write('tree', tree_rec.version, {**state, 'active': None, 'head': new_head}))
+            # 以 active_lease 版本号作为 CAS 守卫，防止与原执行者并发续租发生脑裂。
+            writes.append(Write('active_lease', lease_rec.version if lease_rec else None, _empty_lease(current_time)))
+            writes.append(Write('task:' + task.id, task_version, task_data))
+
+            display_write = await self._recovery_display_write(task.id, status)
+            if display_write is not None:
+                writes.append(display_write)
+
+            if task.source == 'heartbeat':
+                hb_rec = await self.storage.read(self.scope, 'heartbeat')
+                if hb_rec is not None and hb_rec.value.get('heartbeat_pending') == active_id:
+                    # 仅清除待确认占位，不推进 last_heartbeat_at，便于调度器按原周期重新安排心跳。
+                    writes.append(Write('heartbeat', hb_rec.version, {**hb_rec.value, 'heartbeat_pending': None}))
+
+            if (requeue_if_unstarted
+                    and not task.checkpoint_ids and not task.outputs and not task.tool_results
+                    and task.source in ('user', 'business')):
+                # 仅在严格零副作用（无检查点、无输出、无工具结果）且为业务/用户输入时重入队。
+                queue_rec = await self.storage.read(self.scope, 'runtime_queue')
+                existing_items = list(queue_rec.value['items']) if queue_rec else []
+                created_iso = task.created_at.isoformat()
+                requeued_item = {
+                    'id': new_tree_id(),
+                    'question': task.question,
+                    'priority': 0,
+                    'source': task.source,
+                    'replace': None,
+                    'attachments': deepcopy(task.attachments),
+                    'thinking_effort': 'none',
+                    'supplemental': '',
+                    'supplemental_parts': [],
+                    'preview': True,
+                    'parent_id': task.parent_id,
+                    'advance_head': task.advance_head,
+                    'created_at': created_iso,
+                    'deferred': False,
+                    'merged_count': 1,
+                    'last_merged_at': created_iso,
+                }
+                writes.append(Write('runtime_queue', queue_rec.version if queue_rec else None,
+                                    {'items': [requeued_item, *existing_items]}))
+
+            try:
+                await self.storage.atomic(self.scope, writes)
+                return task
+            except StorageConflict:
+                # 另一执行者可能并发续租或已完成恢复，重查最新状态。
+                continue
 
 
 class DisplayRecorder:
@@ -564,6 +759,9 @@ class PersistentJournal(MemoryJournal):
         display_rec = await repo.storage.read(repo.scope, 'display:' + self.task.id)
         if display_rec is not None:
             snapshots.append(Write('display:' + self.task.id, display_rec.version, None))
+        lease_rec = await repo.storage.read(repo.scope, 'active_lease')
+        if lease_rec is not None:
+            snapshots.append(Write('active_lease', lease_rec.version, _empty_lease(datetime.now(timezone.utc))))
         await repo.storage.atomic(repo.scope, [
             Write('tree', tree.version, state), ack, *snapshots, Write('task:' + self.task.id, self.version, None),
             Write('generation:' + self.task.generation_ids[0], 1, None),

@@ -2,11 +2,15 @@
 import asyncio
 import hashlib
 import json
+import logging
 from collections import deque
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from datetime import datetime
 from math import isfinite
 from time import monotonic
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationError
 
 from .adapters import SQLiteStorage
 from .core import AgentInput
@@ -19,6 +23,28 @@ from .storage import StorageConflict, Write
 from .tasks import DisplayRecorder, TaskRepository, _completed_display_data
 
 _UNSET = object()
+DEFAULT_MERGE_SEPARATOR = '\n\n---\n\n'
+logger = logging.getLogger(__name__)
+
+
+class QueueStatus(BaseModel):
+    """任务树持久化队列与活动租约的只读状态快照。"""
+    model_config = ConfigDict(frozen=True)
+    tree_id: str
+    ready_count: int
+    deferred_count: int
+    active_task_id: str | None
+    lease_owner_id: str | None
+    lease_expires_at: AwareDatetime | None
+    lease_expired: bool
+
+
+class ResumeResult(BaseModel):
+    """队列恢复与消费唤醒的结果摘要。"""
+    model_config = ConfigDict(frozen=True)
+    recovered_task_id: str | None
+    queued_count: int
+    draining: bool
 
 
 class SessionExpired(RuntimeError):
@@ -208,6 +234,7 @@ class Session:
         self._task_guidance = {}
         self._active = self._worker = None
         self._expired = False
+        self._stopping = False
         self._pins = 0
         self.touched = monotonic()
 
@@ -221,7 +248,7 @@ class Session:
         return not self.busy and not (self._scheduler and self._scheduler.running)
 
     def _touch(self):
-        if self._expired or self.runtime.closed:
+        if self._expired or self._stopping or self.runtime.closed:
             raise SessionExpired('会话已释放，请重新打开本体或创建新的临时会话')
         self.touched = monotonic()
 
@@ -229,31 +256,85 @@ class Session:
         return await self.repository.storage.read(self.repository.scope, 'runtime_queue')
 
     @staticmethod
-    def _enqueue(items, item, merge_with_previous):
+    def _enqueue(
+        items,
+        item,
+        merge_with_previous,
+        *,
+        merge_separator: str = DEFAULT_MERGE_SEPARATOR,
+        merge_max_messages: int | None = None,
+        merge_max_bytes: int | None = None,
+        merge_max_attachments: int | None = None,
+        merge_interval_seconds: int | float | None = None,
+    ):
+        if not isinstance(merge_separator, str):
+            raise ValueError('merge_separator 必须为字符串')
         if merge_with_previous:
-            # 逆序扫描保持原 FIFO 位置，只选择尚在普通队列中的同级任务。
+            # 逆序扫描保持原 FIFO 位置，只选择尚在普通队列中且同来源、同级的任务。
             for index in reversed(range(len(items))):
                 target = items[index]
                 if (target['priority'] != item['priority'] or target.get('deferred')
-                        or target.get('replace') is not None or target['source'] not in ('user', 'business')
+                        or target.get('replace') is not None
+                        or target['source'] not in ('user', 'business')
+                        or target['source'] != item['source']
                         or target.get('parent_id', 'latest') != item.get('parent_id', 'latest')
                         or target.get('advance_head', True) != item.get('advance_head', True)):
+                    continue
+                target_count = target.get('merged_count', 1)
+                if merge_max_messages is not None and target_count >= merge_max_messages:
+                    continue
+                if merge_interval_seconds is not None:
+                    prev_raw = target.get('last_merged_at') or target.get('created_at')
+                    new_raw = item.get('created_at')
+                    if not prev_raw or not new_raw:
+                        continue
+                    delta = (datetime.fromisoformat(new_raw) - datetime.fromisoformat(prev_raw)).total_seconds()
+                    # 时钟回拨（delta < 0）或超过窗口上限时不再合并。
+                    if delta < 0 or delta > merge_interval_seconds:
+                        continue
+                combined_question = target['question'] + merge_separator + item['question']
+                if merge_max_bytes is not None and len(combined_question.encode('utf-8')) > merge_max_bytes:
                     continue
                 attachments = {ref['file_id']: ref for ref in target['attachments']}
                 for ref in item['attachments']:
                     if attachments.setdefault(ref['file_id'], ref) != ref:
                         raise ValueError('同一附件在合并任务中声明了不同类型')
-                merged = {**target,
-                    'question': target['question'] + '\n\n补充要求：\n' + item['question'],
+                if merge_max_attachments is not None and len(attachments) > merge_max_attachments:
+                    continue
+                # 保序去重 supplemental，兼容不含 supplemental_parts 的历史队列项。
+                existing_parts = target.get('supplemental_parts')
+                if existing_parts is None:
+                    parts = [target['supplemental']] if target.get('supplemental') else []
+                else:
+                    parts = list(existing_parts)
+                new_sup = item.get('supplemental', '')
+                target_sup = target.get('supplemental', '')
+                if new_sup and new_sup not in parts and new_sup != target_sup:
+                    parts.append(new_sup)
+                    merged_supplemental = '\n\n'.join(parts)
+                else:
+                    merged_supplemental = target_sup
+                merged = {
+                    **target,
+                    'question': combined_question,
                     'attachments': list(attachments.values()),
-                    'supplemental': '\n\n'.join(filter(None, (target['supplemental'], item['supplemental']))),
-                    'preview': target.get('preview', True) and item['preview']}
+                    'supplemental': merged_supplemental,
+                    'supplemental_parts': parts,
+                    'preview': target.get('preview', True) and item['preview'],
+                    'merged_count': target_count + 1,
+                    'last_merged_at': item['created_at'],
+                }
                 return [*items[:index], merged, *items[index + 1:]], target['id']
         return [*items, item], item['id']
 
     async def submit(self, question, *, priority=0, merge_with_previous=False, source='user', attachments=(), thinking_effort='none',
                      supplemental='', replace_task_id=None, preview=True, external_id=None, created_at=None, deferred=False,
-                     guidance_factory=_UNSET, parent_id: str | None = 'latest', advance_head: bool = _UNSET):
+                     guidance_factory=_UNSET, parent_id: str | None = 'latest', advance_head: bool = _UNSET,
+                     merge_separator: str = DEFAULT_MERGE_SEPARATOR,
+                     merge_max_messages: int | None = None,
+                     merge_max_bytes: int | None = None,
+                     merge_max_attachments: int | None = None,
+                     merge_interval_seconds: int | float | None = None):
         if type(priority) is not int or source not in ('user', 'business') or not isinstance(supplemental, str):
             raise ValueError('需要整数优先级、有效输入来源和文本上下文')
         if type(preview) is not bool:
@@ -266,6 +347,21 @@ class Session:
             raise ValueError('merge_with_previous 必须为布尔值')
         if merge_with_previous and (deferred or replace_task_id is not None):
             raise ValueError('只有就绪的普通输入可以请求合并')
+        if not isinstance(merge_separator, str):
+            raise ValueError('merge_separator 必须为字符串')
+        if merge_max_messages is not None and (type(merge_max_messages) is not int or merge_max_messages < 1):
+            raise ValueError('merge_max_messages 必须为正整数')
+        if merge_max_bytes is not None and (type(merge_max_bytes) is not int or merge_max_bytes < 1):
+            raise ValueError('merge_max_bytes 必须为正整数')
+        if merge_max_attachments is not None and (type(merge_max_attachments) is not int or merge_max_attachments < 0):
+            raise ValueError('merge_max_attachments 必须为非负整数')
+        if merge_interval_seconds is not None and (
+            isinstance(merge_interval_seconds, bool)
+            or not isinstance(merge_interval_seconds, (int, float))
+            or not isfinite(merge_interval_seconds)
+            or merge_interval_seconds < 0
+        ):
+            raise ValueError('merge_interval_seconds 必须为有限非负数')
         if parent_id not in ('latest', None):
             if not isinstance(parent_id, str) or len(parent_id) != 32 or any(c not in '0123456789abcdef' for c in parent_id):
                 raise ValueError('parent_id 必须为 latest、None 或 32 位小写十六进制任务 ID')
@@ -285,17 +381,23 @@ class Session:
         request = AgentInput(question=question, attachments=list(attachments), source=source, thinking_effort=thinking_effort,
                              **({'created_at':created_at} if created_at is not None else {}))
         ticket = SessionTask(new_tree_id())
+        created_iso = request.created_at.isoformat()
         item = {'id': ticket.id, 'question': question, 'priority': priority, 'source': source,
                 'replace': replace_task_id, 'attachments': [a.model_dump(mode='json') for a in request.attachments],
-                'thinking_effort': thinking_effort, 'supplemental': supplemental, 'preview': preview,
-                'parent_id': parent_id, 'advance_head': queued_advance_head}
-        item['created_at'] = request.created_at.isoformat()
-        item['deferred'] = deferred
+                'thinking_effort': thinking_effort, 'supplemental': supplemental,
+                'supplemental_parts': [supplemental] if supplemental else [],
+                'preview': preview,
+                'parent_id': parent_id, 'advance_head': queued_advance_head,
+                'created_at': created_iso, 'deferred': deferred,
+                'merged_count': 1, 'last_merged_at': created_iso}
         receipt_key = None
         if external_id is not None:
             receipt_key = 'input:' + hashlib.sha256(external_id.encode()).hexdigest()
             fingerprint = {**item,'created_at':item['created_at'] if created_at is not None else None}
             fingerprint.pop('id')
+            fingerprint.pop('supplemental_parts', None)
+            fingerprint.pop('merged_count', None)
+            fingerprint.pop('last_merged_at', None)
             # 默认请求保持旧版指纹，历史 external_id 可继续重投。
             if parent_id == 'latest':
                 fingerprint.pop('parent_id', None)
@@ -303,6 +405,16 @@ class Session:
                 fingerprint.pop('advance_head', None)
             if merge_with_previous:
                 fingerprint['merge_with_previous'] = True
+            if merge_separator != DEFAULT_MERGE_SEPARATOR:
+                fingerprint['merge_separator'] = merge_separator
+            if merge_max_messages is not None:
+                fingerprint['merge_max_messages'] = merge_max_messages
+            if merge_max_bytes is not None:
+                fingerprint['merge_max_bytes'] = merge_max_bytes
+            if merge_max_attachments is not None:
+                fingerprint['merge_max_attachments'] = merge_max_attachments
+            if merge_interval_seconds is not None:
+                fingerprint['merge_interval_seconds'] = merge_interval_seconds
             fingerprint = hashlib.sha256(json.dumps(fingerprint,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
         await self.runtime.evict_idle()
         async with self._lock:
@@ -327,7 +439,16 @@ class Session:
                 active = self._target(replace_task_id) if replace_task_id is not None else None
                 record = await self._queue()
                 items = record.value['items'] if record else []
-                pending, identifier = self._enqueue(items, item, merge_with_previous)
+                pending, identifier = self._enqueue(
+                    items,
+                    item,
+                    merge_with_previous,
+                    merge_separator=merge_separator,
+                    merge_max_messages=merge_max_messages,
+                    merge_max_bytes=merge_max_bytes,
+                    merge_max_attachments=merge_max_attachments,
+                    merge_interval_seconds=merge_interval_seconds,
+                )
                 try:
                     writes = [Write('runtime_queue', record.version if record else None, {'items': pending})]
                     if receipt_key:
@@ -383,7 +504,7 @@ class Session:
 
     async def _scheduled(self, message, identifier, dispatch, publish):
         async with self._lock:
-            if self._active or self._expired:
+            if self._active or self._expired or self._stopping:
                 return
             queue = await self._queue()
             if queue and any(not i.get('deferred') for i in queue.value['items']):
@@ -451,8 +572,34 @@ class Session:
         return target.task.status
 
     def _wake(self):
-        if self._worker is None:
+        if not self._stopping and (self._worker is None or self._worker.done()):
             self._worker = asyncio.create_task(self._drain())
+
+    async def resume(self, *, recover_expired: bool = True, recover_unleased: bool = False) -> ResumeResult:
+        """幂等恢复过期在途任务并唤醒就绪队列消费。"""
+        if type(recover_expired) is not bool:
+            raise ValueError('recover_expired 必须为布尔值')
+        if type(recover_unleased) is not bool:
+            raise ValueError('recover_unleased 必须为布尔值')
+        self._touch()
+        recovered = (
+            await self.repository.recover_expired_active(recover_unleased=recover_unleased)
+            if recover_expired
+            else None
+        )
+        async with self._lock:
+            self._touch()
+            record = await self._queue()
+            items = record.value['items'] if record else []
+            queued_count = sum(1 for entry in items if not entry.get('deferred'))
+            if queued_count > 0 and not self._stopping:
+                self._wake()
+            draining = bool(self._worker and not self._worker.done())
+        return ResumeResult(
+            recovered_task_id=recovered.id if recovered else None,
+            queued_count=queued_count,
+            draining=draining,
+        )
 
     async def _observe_other_workers(self, queued):
         # 另一个进程可能先领取同一持久队列；本地等待者仍以权威终态收束。
@@ -466,8 +613,13 @@ class Session:
                 if rejected is None:
                     raise
                 reason = rejected.value
-                if reason.get('error_type') == 'KeyError':
+                error_type = reason.get('error_type')
+                if error_type == 'KeyError':
                     err = KeyError(reason.get('message', '当前用户任务树中不存在该任务'))
+                elif error_type in ('ValueError', 'ValidationError'):
+                    err = ValueError(reason.get('message', '排队任务输入校验失败'))
+                elif error_type == 'TypeError':
+                    err = TypeError(reason.get('message', '排队任务参数类型不合法'))
                 elif reason.get('message'):
                     err = StorageConflict(reason['message'])
                 else:
@@ -548,9 +700,14 @@ class Session:
 
     async def _drain(self):
         repo = self.repository
+        last_stale_check = 0.0
         try:
             while True:
+                has_remote_active = False
                 async with self._lock:
+                    if self._stopping:
+                        self._worker = None
+                        return
                     record = await self._queue()
                     items = record.value['items'] if record else []
                     queued_ids = {item['id'] for item in items}
@@ -565,6 +722,11 @@ class Session:
                         return
                     # max 保留首个同分项；定向替代在旧任务确认结束后优先接续。
                     tree = await repo.storage.read(repo.scope, 'tree')
+                    has_remote_active = (
+                        self._active is None
+                        and tree is not None
+                        and tree.value['active'] is not None
+                    )
                     waiting = self._active is not None or not items or (tree and tree.value['active'] is not None)
                     if not waiting:
                         try:
@@ -575,7 +737,20 @@ class Session:
                         effective_parent_id = item.get('parent_id', 'latest')
                         effective_advance_head = item.get('advance_head', True)
                         if item['replace']:
-                            old, _ = await repo.load(item['replace'])
+                            try:
+                                old, _ = await repo.load(item['replace'])
+                            except KeyError as error:
+                                msg = error.args[0] if error.args and isinstance(error.args[0], str) else str(error)
+                                try:
+                                    await repo.storage.atomic(repo.scope, [*writes,
+                                        Write('runtime_rejected:' + ticket.id, None,
+                                              {'error_type': 'KeyError', 'message': msg})])
+                                except StorageConflict:
+                                    continue
+                                await ticket.finish('failed', error=error)
+                                self._tickets.pop(ticket.id, None)
+                                self._task_guidance.pop(ticket.id, None)
+                                continue
                             valid_target = (
                                 old.status == 'superseded'
                                 and tree is not None
@@ -610,8 +785,20 @@ class Session:
                         ticket.status = 'running'
                 if waiting:
                     await asyncio.sleep(.05)
+                    if self._stopping:
+                        continue
+                    if has_remote_active:
+                        # 远程/旧进程残留的过期租约按节流间隔自动探测并收束，恢复后立即继续消费。
+                        throttle = min(5.0, self.runtime.agent.lease_seconds / 3)
+                        if monotonic() - last_stale_check >= throttle:
+                            last_stale_check = monotonic()
+                            recovered = await repo.recover_expired_active()
+                            if recovered is not None:
+                                continue
                     continue
                 try:
+                    if self._stopping:
+                        return
                     scheduler = self._scheduler or self.runtime.agent._schedulers.get((self.owner,self.id))
                     task_guidance = self._task_guidance.get(ticket.id, _UNSET)
                     effective_guidance = (
@@ -642,17 +829,22 @@ class Session:
                         await ticket.finish('failed', error=error)
                     else:
                         await ticket.finish('failed', error=error, recorder=recorder)
-                except KeyError as error:
-                    # 指定的历史 parent_id 不存在时直接出队并结束该任务，不中断后续队列消费。
+                except (ValueError, TypeError, ValidationError, KeyError) as error:
+                    # 确定性输入/校验错误在任务尚未正式开始前直接隔离出队，避免毒丸阻塞后续排队项。
                     if not self._active.control.started:
                         if scheduled:
                             self._tickets.pop(ticket.id, None)
                             continue
-                        await self._reject_queued(ticket.id, {'error_type': 'KeyError', 'message': error.args[0] if error.args else str(error)})
+                        msg = error.args[0] if isinstance(error, KeyError) and error.args and isinstance(error.args[0], str) else str(error)
+                        await self._reject_queued(ticket.id, {'error_type': type(error).__name__, 'message': msg})
                         await ticket.finish('failed', error=error)
                     else:
                         await ticket.finish('failed', error=error, recorder=recorder)
                 except asyncio.CancelledError:
+                    if not self._active.control.started:
+                        if self._stopping:
+                            return
+                        raise
                     task, _ = await repo.load(ticket.id)
                     if task.status in ('cancelled', 'superseded'):
                         await ticket.finish(task.status, error=TaskInterrupted(task.status), recorder=recorder)
@@ -660,6 +852,8 @@ class Session:
                         await ticket.finish('failed', error=StorageConflict('停止终态未确认，请回查任务'), recorder=recorder)
                 except Exception as error:
                     if not self._active.control.started:
+                        if self._stopping:
+                            return
                         raise
                     await ticket.finish('failed', error=error, recorder=recorder)
                 else:
@@ -671,13 +865,18 @@ class Session:
                         self._task_guidance.pop(ticket.id, None)
                     self.touched = monotonic()
         except Exception as error:
-            # 存储不可用时唤醒所有等待方。未领取的持久请求仍可在恢复后处理。
+            # 瞬时存储或基础设施故障时保留持久队列供后续 resume() 重试，仅唤醒当前本地等待方。
+            logger.warning('会话队列消费异常退出：%s', type(error).__name__)
             async with self._lock:
                 for ticket in self._tickets.values():
                     await ticket.finish('failed', error=error)
                 self._tickets.clear()
                 self._task_guidance.clear()
                 self._worker = self._active = None
+        finally:
+            self._active = None
+            if self._worker is asyncio.current_task():
+                self._worker = None
 
     def _live_displays(self):
         # 仅在任务已正式开始后叠加内存实时展示快照（含流式前缀与最新序号）。
@@ -724,8 +923,8 @@ class SessionRuntime:
     def resident(self, owner, identifier):
         return self._residents.get((owner, identifier))
 
-    async def _release(self, session):
-        if session.busy:
+    async def _release(self, session, *, force: bool = False):
+        if not force and session.busy:
             raise StorageConflict('会话有等待、执行或恢复操作')
         session._expired = True
         for ticket in session._tickets.values():
@@ -736,7 +935,7 @@ class SessionRuntime:
         session.repository.baseline = ContextInjection()
         session.repository.snapshot = session.repository.baseline
         session.repository.tip = None
-        self._residents.pop((session.owner, session.id))
+        self._residents.pop((session.owner, session.id), None)
         if session._scheduler:
             await session._scheduler.close()
         # 无论持久树、内存会话还是冻结分身，释放或空闲驱逐时均同步释放对应的会话缓存作用域。
@@ -895,15 +1094,82 @@ class SessionRuntime:
             session._touch()
             return session
 
-    async def close(self):
-        await asyncio.gather(*(self._settle_idle(s) for s in tuple(self._residents.values())))
+    async def close(self, *, graceful: bool = False, timeout: float = 30.0):
+        if type(graceful) is not bool:
+            raise ValueError('graceful 必须为布尔值')
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not isfinite(timeout) or timeout <= 0:
+            raise ValueError('timeout 必须为有限正数')
+        if not graceful:
+            await asyncio.gather(*(self._settle_idle(s) for s in tuple(self._residents.values())))
+            async with self._lock:
+                if any(session.busy for session in self._residents.values()):
+                    raise StorageConflict('运行时仍有排队或执行中的任务')
+                self.closed = True
+                if self._maintenance is not None:
+                    self._maintenance.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await self._maintenance
+                for session in list(self._residents.values()):
+                    await self._release(session)
+            return
+
+        # 优雅停机：通知各驻留会话停止继续拉取持久队列，限时等待在途单任务完成，超时后取消并清理本地句柄。
+        residents = tuple(self._residents.values())
+        schedulers = []
+        for session in residents:
+            session._stopping = True
+            if session._scheduler is not None:
+                session._scheduler._stop.set()
+                schedulers.append(session._scheduler)
+
+        deadline = monotonic() + float(timeout)
+        current = asyncio.current_task()
+        while True:
+            pending = {
+                task
+                for task in (
+                    *(s._worker for s in tuple(self._residents.values())),
+                    *(sc._worker for sc in schedulers),
+                )
+                if task is not None and task is not current and not task.done()
+            }
+            if not pending:
+                break
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.wait(pending, timeout=remaining)
+
+        for session in tuple(self._residents.values()):
+            active = session._active
+            if active is not None:
+                with suppress(StorageConflict):
+                    active.control.interrupt('cancelled')
+        to_cancel = {
+            s._worker
+            for s in tuple(self._residents.values())
+            if s._worker is not None and s._worker is not current and not s._worker.done()
+        }
+        for task in to_cancel:
+            task.cancel()
+        if to_cancel:
+            await asyncio.gather(*to_cancel, return_exceptions=True)
+
+        remaining_schedulers = {
+            sc._worker
+            for sc in schedulers
+            if sc._worker is not None and sc._worker is not current and not sc._worker.done()
+        }
+        for task in remaining_schedulers:
+            task.cancel()
+        if remaining_schedulers:
+            await asyncio.gather(*remaining_schedulers, return_exceptions=True)
+
         async with self._lock:
-            if any(session.busy for session in self._residents.values()):
-                raise StorageConflict('运行时仍有排队或执行中的任务')
             self.closed = True
             if self._maintenance is not None:
                 self._maintenance.cancel()
                 with suppress(asyncio.CancelledError):
                     await self._maintenance
             for session in list(self._residents.values()):
-                await self._release(session)
+                await self._release(session, force=True)

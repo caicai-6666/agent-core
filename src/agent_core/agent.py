@@ -4,6 +4,9 @@ from contextlib import suppress
 from dataclasses import dataclass, asdict
 from functools import partial
 import json
+import logging
+from math import isfinite
+from time import monotonic
 from pydantic import BaseModel, ConfigDict
 from .core import AgentCore, AgentInput, AgentResult, CoreSettings, AgentCoreError
 from .core.model import ContextInjection
@@ -18,7 +21,7 @@ from .core.tool.hooks import FeedbackOnlyHook, normalize_tool_hooks
 from .core.tool.cache import SessionCacheScopes
 from .file_notes import FileNoteStore, create_file_note_cache_pool
 from .model.question_tree import new_tree_id
-from .tasks import DisplayRecorder, PersistentJournal, TaskRepository, _completed_display_data
+from .tasks import DisplayRecorder, PersistentJournal, TaskRepository, _completed_display_data, validate_lease_seconds
 from .memory import Memory
 from .providers import Models, RuntimeSettings
 from .storage import StorageConflict
@@ -35,6 +38,15 @@ class FinishTask(FinishTaskTool):
 
 
 _UNSET = object()
+logger = logging.getLogger(__name__)
+
+
+def _validate_close_options(graceful: bool, timeout: float) -> float:
+    if type(graceful) is not bool:
+        raise ValueError('graceful 必须为布尔值')
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not isfinite(timeout) or timeout <= 0:
+        raise ValueError('timeout 必须为有限正数')
+    return float(timeout)
 
 
 @dataclass(frozen=True)
@@ -63,7 +75,8 @@ class Agent:
                  memory_tools=True, reminder_tools=False,
                  file_note_tools: bool = False, file_note_authorize=None,
                  guidance_factory=None, tool_hooks=None, prompt_options: PromptOptions | None = None,
-                 session_capacity=100, session_ttl_seconds=1800, workspace_retention="per_node"):
+                 session_capacity=100, session_ttl_seconds=1800, workspace_retention="per_node",
+                 lease_seconds: float = 300.0, owner_id: str | None = None):
         if not isinstance(role, str) or not role.strip():
             raise ValueError('必须提供业务角色提示词')
         if workspace_retention not in ('per_node', 'latest'):
@@ -76,6 +89,10 @@ class Agent:
             raise TypeError('guidance_factory 必须可调用或为 None')
         if prompt_options is not None and not isinstance(prompt_options, PromptOptions):
             raise TypeError('prompt_options 必须为 PromptOptions 实例或 None')
+        if owner_id is not None and (not isinstance(owner_id, str) or not owner_id.strip()):
+            raise ValueError('owner_id 必须为非空字符串')
+        self.lease_seconds = validate_lease_seconds(lease_seconds)
+        self.owner_id = owner_id if owner_id is not None else new_tree_id()
         self.workspace_retention = workspace_retention
         self.models, self.storage, self.role = models, storage, role
         self.settings = settings or RuntimeSettings()
@@ -137,12 +154,15 @@ class Agent:
         journal = None
         recorder = None
         owns_display = False
+        lease_task = None
+        lease_lost = False
         try:
             request = AgentInput(source=_dispatch.kind if _dispatch else 'user', question=question, attachments=list(attachments), thinking_effort=thinking_effort,
                                  **({'created_at': created_at} if created_at is not None else {}))
             repository = _repository or self.repository(owner, tree_id)
             task, version, created = await repository.begin(
-                request, task_id=task_id, parent_id=parent_id, dispatch=_dispatch, advance_head=advance_head
+                request, task_id=task_id, parent_id=parent_id, dispatch=_dispatch, advance_head=advance_head,
+                owner_id=self.owner_id, lease_seconds=self.lease_seconds,
             )
             if not created:
                 if task.status == 'complete' and task.result is not None:
@@ -154,6 +174,46 @@ class Agent:
             journal.control = _control
             if _control:
                 _control.started = True
+
+            async def _renew_loop():
+                nonlocal lease_lost
+                interval = self.lease_seconds / 3
+                deadline = monotonic() + self.lease_seconds
+                while True:
+                    await asyncio.sleep(interval)
+                    if journal.pruned or journal.status != 'generating':
+                        return
+                    try:
+                        ok = await repository.renew_lease(task.id, self.owner_id, self.lease_seconds)
+                    except Exception as renew_error:
+                        logger.warning('任务租约续期异常：%s', type(renew_error).__name__)
+                        if monotonic() < deadline:
+                            continue
+                        ok = False
+                    if ok:
+                        deadline = monotonic() + self.lease_seconds
+                        continue
+                    # 续租返回 False 时核实任务是否已正常完成或被静默裁剪，避免误伤终态收尾。
+                    if journal.pruned or journal.status != 'generating':
+                        return
+                    try:
+                        current_task, _ = await repository.load(task.id, include_workspace=False)
+                        if current_task.status == 'complete':
+                            return
+                    except KeyError:
+                        return
+                    except Exception:
+                        pass
+                    # 租约已丢失或被接管：立即打断并取消本执行任务，防止脑裂。
+                    lease_lost = True
+                    if _control is not None:
+                        with suppress(StorageConflict):
+                            _control.interrupt('cancelled')
+                    if running is not None and not running.done():
+                        running.cancel()
+                    return
+
+            lease_task = asyncio.create_task(_renew_loop())
             if _display is not None:
                 recorder = _display
                 owns_display = False
@@ -339,6 +399,12 @@ class Agent:
             else:
                 result = await core.run(request, journal=journal, publish=publish,
                     publish_progress=progress, output_observer=observer)
+            # 核心循环已落库终态并释放租约，立即停止续租协程以避免干扰后续索引与收尾。
+            if lease_task is not None:
+                lease_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await lease_task
+                lease_task = None
             if journal.pruned:
                 recorder.pruned = True
                 return result
@@ -364,9 +430,14 @@ class Agent:
                 )
             return result
         except BaseException as error:
+            if lease_task is not None:
+                lease_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await lease_task
+                lease_task = None
             if journal is not None and journal.status == 'generating':
                 with suppress(Exception):
-                    await journal.abort('cancelled' if asyncio.current_task().cancelling() else 'failed')
+                    await journal.abort('cancelled' if (lease_lost or asyncio.current_task().cancelling()) else 'failed')
             if (owns_display and recorder is not None and journal is not None
                     and not journal.pruned and journal.status != 'generating'):
                 if isinstance(error, asyncio.CancelledError):
@@ -382,13 +453,22 @@ class Agent:
                                 'message': '执行或收尾未正常结束，请通过任务 ID 回查已提交状态；不要直接重放外部动作。',
                             },
                         )
+            if lease_lost and running is not None and running.cancelling():
+                # 仅抵消由本任务租约丢失触发的一次内部 cancel，避免污染复用协程的 cancelling 计数。
+                running.uncancel()
             raise
         finally:
             try:
-                if journal is not None:
-                    await journal.flush_audit()
+                if lease_task is not None:
+                    lease_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await lease_task
             finally:
-                self._running.discard(running)
+                try:
+                    if journal is not None:
+                        await journal.flush_audit()
+                finally:
+                    self._running.discard(running)
 
     async def stream(self, question, *, preview=True, **kwargs):
         queue = asyncio.Queue(maxsize=64)
@@ -439,14 +519,85 @@ class Agent:
             with suppress(asyncio.CancelledError):
                 await worker
 
-    async def close(self):
-        await asyncio.gather(*(scheduler.close() for scheduler in tuple(self._schedulers.values())))
-        for session in tuple(self.sessions._residents.values()):
-            if session.managed_heartbeat:
-                await session._scheduler.close()
-        if self._running:
-            raise RuntimeError('先取消并等待活动任务，再关闭 Agent')
-        await self.sessions.close()
+    async def close(self, *, graceful: bool = False, timeout: float = 30.0):
+        timeout = _validate_close_options(graceful, timeout)
+        if not graceful:
+            await asyncio.gather(*(scheduler.close() for scheduler in tuple(self._schedulers.values())))
+            for session in tuple(self.sessions._residents.values()):
+                if session.managed_heartbeat:
+                    await session._scheduler.close()
+            if self._running:
+                raise RuntimeError('先取消并等待活动任务，再关闭 Agent')
+            await self.sessions.close(graceful=False, timeout=timeout)
+            self._closed = True
+            self.cache_scopes.close()
+            return
+            # storage 和两个 provider 均由调用方注入，关闭责任留在调用方。
+
+        # 优雅停机：先阻止继续消费与调度新任务，再限时等待在途单任务自然收束，超时后取消并落库释放租约。
+        residents = tuple(self.sessions._residents.values())
+        schedulers = list(self._schedulers.values())
+        for session in residents:
+            session._stopping = True
+            if session._scheduler is not None and session._scheduler not in schedulers:
+                schedulers.append(session._scheduler)
+        for scheduler in schedulers:
+            scheduler._stop.set()
         self._closed = True
+
+        deadline = monotonic() + timeout
+        current = asyncio.current_task()
+        while True:
+            pending = {
+                task
+                for task in (
+                    *(s._worker for s in tuple(self.sessions._residents.values())),
+                    *(sc._worker for sc in schedulers),
+                    *tuple(self._running),
+                )
+                if task is not None and task is not current and not task.done()
+            }
+            if not pending:
+                break
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.wait(pending, timeout=remaining)
+
+        # 若超时期满仍有任务在途，依次打断并取消运行中的任务，等待 Agent.run 完成 journal.abort 与租约释放。
+        for session in tuple(self.sessions._residents.values()):
+            active = session._active
+            if active is not None:
+                with suppress(StorageConflict):
+                    active.control.interrupt('cancelled')
+        to_cancel = {
+            task
+            for task in (
+                *tuple(self._running),
+                *(s._worker for s in tuple(self.sessions._residents.values())),
+            )
+            if task is not None and task is not current and not task.done()
+        }
+        for task in to_cancel:
+            task.cancel()
+        if to_cancel:
+            await asyncio.gather(*to_cancel, return_exceptions=True)
+
+        remaining_schedulers = {
+            sc._worker
+            for sc in schedulers
+            if sc._worker is not None and sc._worker is not current and not sc._worker.done()
+        }
+        for task in remaining_schedulers:
+            task.cancel()
+        if remaining_schedulers:
+            await asyncio.gather(*remaining_schedulers, return_exceptions=True)
+
+        for scheduler in schedulers:
+            key = (scheduler.owner, scheduler.tree_id)
+            if self._schedulers.get(key) is scheduler:
+                del self._schedulers[key]
+
+        await self.sessions.close(graceful=True, timeout=max(0.001, deadline - monotonic()))
         self.cache_scopes.close()
         # storage 和两个 provider 均由调用方注入，关闭责任留在调用方。

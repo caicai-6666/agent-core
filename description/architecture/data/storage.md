@@ -53,6 +53,7 @@ SQLite 另有 `memory_fts` 支撑记忆 BM25 检索、`file_notes_fts` 支撑文
 | 键 | 内容与生命周期 |
 | --- | --- |
 | `tree` | 当前 head、唯一 active 任务、任务 ID 列表及工作区保留策略 |
+| `active_lease` | 当前在途任务的执行租约（`task_id`、`owner_id`、`expires_at`、`updated_at`）；与 `tree.active` 同事务 CAS 写入/释放，运行期由 `renew_lease()` 定期续租，作为自动僵尸恢复的 CAS 守卫 |
 | `task:<id>` | 父任务、用户原文、附件、计时字段（`started_at`、`finished_at`、`duration_ms`）、`advance_head` 标记、终态、按策略保存的工作区、完整已接受轨迹、公开输出、结构化结果（旧记录缺省按兼容默认值反序列化） |
 | `display:<task-id>` | 面向前端展示的公开事件日志（`events`、`streaming_messages`、`last_sequence`）；仅在非 delta 公开事件（`task.started`、`progress`、`message.completed`、`memory.deferred`、终态 `task.<status>`）时 CAS 持久化，严禁写入私有 `exchanges`、`audit`、工作区大对象或内部 `tool_result` |
 | `generation:<id>` | 私有原始模型响应、分片、用途及失败；不进入普通历史/记忆检索 |
@@ -123,7 +124,7 @@ SQLite 用 FTS5 BM25 和精确余弦排序，中文逐字加二元组切分；�
 
 同一 `owner/tree_id` 作用域内，`reminders` 保存排期，`reminder_queue` 保存冻结的到期事项。模型可见的创建、删除回执与权威检查点同事务提交。扫描器原子写入队列与下一次排期；消费者用同一事务出队、创建任务并占用树。竞争失败的扫描重新读取持久化状态。启用调度后，宿主重启需要重新绑定该树。
 
-任务 `source` 区分用户、心跳和定时任务；旧记录默认是用户任务。同一作用域的 `heartbeat` 记录用 `heartbeat_pending` 保存未确认的心跳 ID，`last_heartbeat_at` 保存确认时间。保留的心跳在执行及交付确认后更新时间；成功静默裁剪在裁剪事务内确认。
+任务 `source` 区分用户、心跳和定时任务；旧记录默认是用户任务。同一作用域的 `heartbeat` 记录用 `heartbeat_pending` 保存未确认的心跳 ID，`last_heartbeat_at` 保存确认时间。保留的心跳在执行及交付确认后更新时间；成功静默裁剪在裁剪事务内确认。当 `TaskRepository.recover_expired_active()` 自动收束来源为 `heartbeat` 的过期僵尸任务时，在同一事务内清除 `tree.active`、`active_lease` 及匹配的 `heartbeat.heartbeat_pending`，但**不更新 `last_heartbeat_at`**，以便 `AgentScheduler._tick()` 在自动恢复后按原周期继续调度提醒与心跳。
 
 存储适配器提供 `supports_atomic_delete=True` 表示支持 `Write(key, expected_version, None)` 同事务按版本删除。启用该声明前须验证删除与其他写入可整体回滚；SQLite 已实现。旧适配器可正常运行心跳，模型请求裁剪时会得到保留记录的反馈。
 
@@ -133,6 +134,14 @@ SQLite 用 FTS5 BM25 和精确余弦排序，中文逐字加二元组切分；�
 
 ## 会话队列与冻结分身
 
-`runtime_session` 保存该任务树的执行模式。`runtime_queue` 保存等待项的任务 ID、原始请求、业务来源、优先级、可选的替代目标、可选的 `parent_id`（缺省按 `"latest"` 处理以兼容历史队列）、可选的 `advance_head`（缺省按 `True` 处理；定向替代未显式指定时继承被替代任务的策略）及可选的 `deferred` 标记（允许与 `replace_task_id` 组合，先立即中断旧任务再等待显式激活）。成功领取时，出队、树占用和创建任务同事务提交。替代目标未以 superseded 结束或不符合续接条件（`advance_head=True` 须为当前 `head`，`advance_head=False` 须仍在树中），以及指定的 `parent_id` 不存在或在 `latest` 策略下历史工作区已释放时，原子出队并保存 `runtime_rejected:<id>`，不创建虚假执行，也不反复重试阻塞队列。普通业务注入使用 business 来源，在当前及历史上下文中展示为业务系统任务，不作为用户口述内容进入记忆索引。
+`runtime_session` 保存该任务树的执行模式。`runtime_queue` 保存等待项的任务 ID、原始请求、业务来源、优先级、可选的替代目标、可选的 `parent_id`（缺省按 `"latest"` 处理以兼容历史队列）、可选的 `advance_head`（缺省按 `True` 处理；定向替代未显式指定时继承被替代任务的策略）、可选的 `deferred` 标记（允许与 `replace_task_id` 组合，先立即中断旧任务再等待显式激活），以及合并元信息 `merged_count`（缺省按 `1` 兼容旧项）、`last_merged_at`（缺省按 `created_at` 兼容旧项）与 `supplemental_parts`（保序去重片段列表，缺省由 `supplemental` 初始化）。合并仅限同 `source`（不跨 `user`/`business`）、同优先级、同 `parent_id`、同 `advance_head` 的已就绪普通等待项，默认以 `\n\n---\n\n` 拼接并按需校验条数、字节数、附件数与时间间隔上限。
+
+成功领取时，出队、树占用、`active_lease` 写入和创建任务同事务提交。以下永久性失败场景会在任务尚未进入执行态前原子出队并写入 `runtime_rejected:<id>`，不创建虚假执行，也不反复重试或击溃消费循环：
+
+1. 替代目标未以 `superseded` 结束或不符合续接条件（`advance_head=True` 须为当前 `head`，`advance_head=False` 须仍在树中）；
+2. 指定的 `parent_id` 不存在或在 `latest` 策略下历史工作区已释放；
+3. **毒丸隔离**：队列项触发确定性输入/校验错误（`ValueError`、`TypeError`、`ValidationError`、`KeyError`）时记录 `{"error_type": ..., "message": ...}` 并继续消费后续合法项。
+
+瞬时存储/基础设施异常仍保留原队列项供下次 `resume()` 重试。普通业务注入使用 `business` 来源，在当前及历史上下文中展示为业务系统任务，不作为用户口述内容进入记忆索引。
 
 冻结分身的基础快照与本体隔离，冷恢复或热复用均以已提交终态节点为准；分身结束后的工作区、轨迹及向量保存在独享内存库。本体的提醒写入使用本体作用域的版本校验。宿主自定义工具的数据库连接及副作用归宿主所有。

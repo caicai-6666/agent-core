@@ -1,13 +1,17 @@
 """面向业务调用方的树实例；共用一个执行器、驻留池和数据库连接池。"""
-from .agent import Agent
+import asyncio
+from datetime import datetime
+from typing import Literal
+
+from .agent import Agent, _validate_close_options
 from .core.prompt import PromptOptions
 from .core.tool import BaseTool, RegisteredTool, ToolRegistry, build_builtin_registrations
 from .core.tool.hooks import normalize_tool_hooks
 from .core.model import ContextInjection
 from .model.question_tree import new_tree_id
-from .scheduler import SchedulerSettings
-from .sessions import SessionExpired, _UNSET
-from .tasks import TaskRepository
+from .scheduler import SchedulerSettings, utc_now
+from .sessions import DEFAULT_MERGE_SEPARATOR, QueueStatus, ResumeResult, SessionExpired, _UNSET
+from .tasks import TaskRepository, validate_lease_seconds
 
 
 def _instance_tools(tools):
@@ -73,12 +77,19 @@ class TreeAgent:
 
     async def generate(self, question, *, priority=0, merge_with_previous=False, external_id=None, created_at=None,
                        deferred=False, source='user', attachments=(), thinking_effort='none', supplemental='', preview=True,
-                       guidance_factory=_UNSET, parent_id: str | None = 'latest', advance_head: bool = True):
+                       guidance_factory=_UNSET, parent_id: str | None = 'latest', advance_head: bool = True,
+                       merge_separator: str = DEFAULT_MERGE_SEPARATOR,
+                       merge_max_messages: int | None = None,
+                       merge_max_bytes: int | None = None,
+                       merge_max_attachments: int | None = None,
+                       merge_interval_seconds: int | float | None = None):
         session = await self._resident()
         return await session.submit(question,priority=priority,merge_with_previous=merge_with_previous,external_id=external_id,created_at=created_at,
             deferred=deferred,source=source,attachments=attachments,thinking_effort=thinking_effort,
             supplemental=supplemental,preview=preview,guidance_factory=guidance_factory,parent_id=parent_id,
-            advance_head=advance_head)
+            advance_head=advance_head,merge_separator=merge_separator,merge_max_messages=merge_max_messages,
+            merge_max_bytes=merge_max_bytes,merge_max_attachments=merge_max_attachments,
+            merge_interval_seconds=merge_interval_seconds)
 
     async def activate(self, task_id):
         return await (await self._resident()).activate(task_id)
@@ -95,6 +106,30 @@ class TreeAgent:
         if session.active_task_id is not None:
             raise RuntimeError('实例仍有活动任务，不能恢复')
         return await session.repository.recover(task_id,status=status)
+
+    async def recover_stale(
+        self,
+        *,
+        now: datetime | None = None,
+        status: Literal['failed', 'cancelled', 'superseded'] = 'failed',
+        recover_unleased: bool = False,
+        stale_owner_ids: set[str] | None = None,
+        requeue_if_unstarted: bool = False,
+    ):
+        """按租约状态自动收束当前任务树中已过期或指定失效持有者的在途任务。"""
+        session = await self._resident()
+        return await session.repository.recover_expired_active(
+            now=now,
+            status=status,
+            recover_unleased=recover_unleased,
+            stale_owner_ids=stale_owner_ids,
+            requeue_if_unstarted=requeue_if_unstarted,
+        )
+
+    async def resume(self, *, recover_expired: bool = True, recover_unleased: bool = False) -> ResumeResult:
+        """幂等恢复过期在途任务并唤醒当前任务树的持久队列消费。"""
+        session = await self._resident()
+        return await session.resume(recover_expired=recover_expired, recover_unleased=recover_unleased)
 
     async def snapshot(self, task_id=None):
         return await (await self._resident()).snapshot(task_id)
@@ -116,15 +151,19 @@ class TreeAgent:
 class AgentRuntime:
     """模型与运行配置共享，每个数据库适配器独立管理同名的树和驻留容量。"""
     def __init__(self, *, models, database=None, capacity=100, ttl_seconds=1800,
-                 legacy_owner=None, settings=None, options=None, file_note_authorize=None):
+                 legacy_owner=None, settings=None, options=None, file_note_authorize=None,
+                 lease_seconds: float = 300.0):
         self.database = database
         # 新接口在数据库内使用固定命名空间；可显式绑定旧版 owner 来接续现存树。
         self._owner = 'agent-core:trees' if legacy_owner is None else legacy_owner
         if not self._owner.strip():
             raise ValueError('旧版 owner 不能为空')
+        self.lease_seconds = validate_lease_seconds(lease_seconds)
+        self.owner_id = new_tree_id()
         self._engine_options = dict(models=models,session_capacity=capacity,session_ttl_seconds=ttl_seconds,
                                     settings=settings,options=options,reminder_tools=True,
-                                    file_note_authorize=file_note_authorize)
+                                    file_note_authorize=file_note_authorize,
+                                    lease_seconds=self.lease_seconds,owner_id=self.owner_id)
         self._engines = {}
         self._closed = False
 
@@ -219,7 +258,49 @@ class AgentRuntime:
                 live_displays = resident._live_displays()
         return await repo.tree(include_display=include_display, live_displays=live_displays)
 
-    async def close(self):
+    async def queue_status(self, tree_id: str, *, database=None) -> QueueStatus:
+        """无状态只读查询任务树的持久队列与活动租约状态，不创建驻留会话也不占用容量。"""
+        engine = self._engine_for(database)
+        repo, state = await self._metadata(engine, tree_id)
+        active_task_id = state.get('active')
+        lease_rec = await repo.storage.read(repo.scope, 'active_lease')
+        queue_rec = await repo.storage.read(repo.scope, 'runtime_queue')
+        items = queue_rec.value['items'] if queue_rec else []
+        ready_count = sum(1 for entry in items if not entry.get('deferred'))
+        deferred_count = len(items) - ready_count
+
+        lease_owner_id = None
+        lease_expires_at = None
+        lease_expired = False
+        if active_task_id is not None:
+            now = utc_now()
+            lease_val = lease_rec.value if lease_rec is not None else None
+            if lease_val is None or lease_val.get('task_id') != active_task_id:
+                lease_expired = True
+            else:
+                lease_owner_id = lease_val.get('owner_id')
+                expires_raw = lease_val.get('expires_at')
+                if expires_raw is None:
+                    lease_expired = True
+                else:
+                    lease_expires_at = datetime.fromisoformat(expires_raw)
+                    lease_expired = lease_expires_at <= now
+        return QueueStatus(
+            tree_id=tree_id,
+            ready_count=ready_count,
+            deferred_count=deferred_count,
+            active_task_id=active_task_id,
+            lease_owner_id=lease_owner_id,
+            lease_expires_at=lease_expires_at,
+            lease_expired=lease_expired,
+        )
+
+    async def close(self, *, graceful: bool = False, timeout: float = 30.0):
+        timeout = _validate_close_options(graceful, timeout)
         self._closed = True
-        for engine in tuple(self._engines.values()):
-            await engine.close()
+        engines = tuple(self._engines.values())
+        if graceful:
+            await asyncio.gather(*(engine.close(graceful=True, timeout=timeout) for engine in engines))
+        else:
+            for engine in engines:
+                await engine.close(graceful=False, timeout=timeout)
